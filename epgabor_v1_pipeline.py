@@ -1,12 +1,14 @@
-"""v1 pipeline for layerwise mean-orientation decoding in pretrained CNNs."""
+"""v1.1 pipeline for layerwise mean-orientation decoding in pretrained CNNs."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import timm
@@ -30,7 +32,19 @@ class SplitSpec:
     test_nonzero_mask: np.ndarray
     boundary_mask: np.ndarray
     held_out_axis: str
-    held_out_value: int
+    held_out_value: Any
+
+
+@dataclass
+class ConditionFilter:
+    means: Optional[List[int]] = None
+    sds: Optional[List[int]] = None
+    sss: Optional[List[int]] = None
+    instances: Optional[List[int]] = None
+    exclude_means: Optional[List[int]] = None
+    exclude_sds: Optional[List[int]] = None
+    exclude_sss: Optional[List[int]] = None
+    exclude_instances: Optional[List[int]] = None
 
 
 def make_deterministic_transform(input_size: int = 224) -> transforms.Compose:
@@ -84,6 +98,25 @@ def _get_layer_path_map(model_name: str) -> Dict[str, str]:
     raise ValueError(f"Unsupported model_name: {model_name}")
 
 
+def list_available_layers(model_name: str, source: str = "timm") -> pd.DataFrame:
+    """List pipeline-facing layer names and the underlying module paths."""
+    if source != "timm":
+        raise ValueError(f"Unsupported source: {source}")
+
+    model = timm.create_model(model_name, pretrained=False)
+    rows = []
+    for layer_name, module_path in _get_layer_path_map(model_name).items():
+        module = model.get_submodule(module_path)
+        rows.append(
+            {
+                "layer_name": layer_name,
+                "module_path": module_path,
+                "module_type": module.__class__.__name__,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def get_model_and_layer_map(
     model_name: str,
     pretrained: bool = True,
@@ -109,6 +142,18 @@ def get_model_and_layer_map(
     return model, layer_map
 
 
+def select_layer_map(
+    layer_map: Dict[str, torch.nn.Module],
+    selected_layer: str = "all",
+) -> Dict[str, torch.nn.Module]:
+    if selected_layer == "all":
+        return dict(layer_map)
+    if selected_layer not in layer_map:
+        valid = ", ".join(layer_map.keys())
+        raise ValueError(f"Invalid layer '{selected_layer}'. Valid layers: {valid}")
+    return {selected_layer: layer_map[selected_layer]}
+
+
 def _pool_activation(activation: torch.Tensor, pooling: str = "gap") -> torch.Tensor:
     if pooling != "gap":
         raise ValueError(f"Unsupported pooling mode: {pooling}")
@@ -116,7 +161,6 @@ def _pool_activation(activation: torch.Tensor, pooling: str = "gap") -> torch.Te
     if activation.ndim == 2:
         return activation
     if activation.ndim == 3:
-        # e.g., [B, tokens, C]
         return activation.mean(dim=1)
     if activation.ndim == 4:
         return activation.mean(dim=(2, 3))
@@ -182,12 +226,62 @@ def extract_layer_features(
     return layer_features, metadata
 
 
-def build_cross_condition_splits(
+def _eligible_mask(metadata: pd.DataFrame, condition_filter: Optional[ConditionFilter]) -> np.ndarray:
+    mask = np.ones(len(metadata), dtype=bool)
+    if condition_filter is None:
+        return mask
+
+    if condition_filter.means is not None:
+        mask &= metadata["mean"].isin(condition_filter.means).to_numpy()
+    if condition_filter.sds is not None:
+        mask &= metadata["sd"].isin(condition_filter.sds).to_numpy()
+    if condition_filter.sss is not None:
+        mask &= metadata["ss"].isin(condition_filter.sss).to_numpy()
+    if condition_filter.instances is not None:
+        mask &= metadata["instance"].isin(condition_filter.instances).to_numpy()
+
+    if condition_filter.exclude_means is not None:
+        mask &= ~metadata["mean"].isin(condition_filter.exclude_means).to_numpy()
+    if condition_filter.exclude_sds is not None:
+        mask &= ~metadata["sd"].isin(condition_filter.exclude_sds).to_numpy()
+    if condition_filter.exclude_sss is not None:
+        mask &= ~metadata["ss"].isin(condition_filter.exclude_sss).to_numpy()
+    if condition_filter.exclude_instances is not None:
+        mask &= ~metadata["instance"].isin(condition_filter.exclude_instances).to_numpy()
+
+    return mask
+
+
+def build_controlled_splits(
     metadata: pd.DataFrame,
     split_mode: str = "leave_one_sd_out",
     holdout_values: Optional[Iterable[int]] = None,
+    train_filter: Optional[ConditionFilter] = None,
+    test_filter: Optional[ConditionFilter] = None,
 ) -> List[SplitSpec]:
-    """Build non-overlapping train/test masks with m=0 held out from training."""
+    """Build train/test masks with explicit eligibility control."""
+    train_eligible = _eligible_mask(metadata, train_filter)
+    test_eligible = _eligible_mask(metadata, test_filter)
+
+    mean_values = metadata["mean"].to_numpy()
+
+    if split_mode == "explicit":
+        train_mask = train_eligible & (mean_values != 0)
+        test_nonzero_mask = test_eligible & (mean_values != 0)
+        boundary_mask = test_eligible & (mean_values == 0)
+        if np.any(train_mask & test_nonzero_mask) or np.any(train_mask & boundary_mask):
+            raise ValueError("Explicit train/test filters overlap. Make them disjoint.")
+        return [
+            SplitSpec(
+                split_id="explicit",
+                train_mask=train_mask,
+                test_nonzero_mask=test_nonzero_mask,
+                boundary_mask=boundary_mask,
+                held_out_axis="explicit",
+                held_out_value="explicit",
+            )
+        ]
+
     if split_mode not in {"leave_one_sd_out", "leave_one_ss_out"}:
         raise ValueError(f"Unsupported split_mode: {split_mode}")
 
@@ -197,18 +291,22 @@ def build_cross_condition_splits(
     else:
         holdout_values = [int(v) for v in holdout_values]
 
-    mean_values = metadata["mean"].to_numpy()
     axis_values = metadata[axis].to_numpy()
     splits: List[SplitSpec] = []
     for value in holdout_values:
         in_holdout = axis_values == value
-        train_mask = (~in_holdout) & (mean_values != 0)
-        test_nonzero_mask = in_holdout & (mean_values != 0)
-        boundary_mask = in_holdout & (mean_values == 0)
-        split_id = f"{axis}{value}"
+        train_mask = train_eligible & (~in_holdout) & (mean_values != 0)
+        test_nonzero_mask = test_eligible & in_holdout & (mean_values != 0)
+        boundary_mask = test_eligible & in_holdout & (mean_values == 0)
+
+        if np.any(train_mask & test_nonzero_mask) or np.any(train_mask & boundary_mask):
+            raise ValueError(
+                f"Train/test overlap detected for split {axis}{value}. Check filters."
+            )
+
         splits.append(
             SplitSpec(
-                split_id=split_id,
+                split_id=f"{axis}{value}",
                 train_mask=train_mask,
                 test_nonzero_mask=test_nonzero_mask,
                 boundary_mask=boundary_mask,
@@ -217,6 +315,21 @@ def build_cross_condition_splits(
             )
         )
     return splits
+
+
+def build_cross_condition_splits(
+    metadata: pd.DataFrame,
+    split_mode: str = "leave_one_sd_out",
+    holdout_values: Optional[Iterable[int]] = None,
+) -> List[SplitSpec]:
+    """Backward-compatible wrapper around the controlled split builder."""
+    return build_controlled_splits(
+        metadata=metadata,
+        split_mode=split_mode,
+        holdout_values=holdout_values,
+        train_filter=None,
+        test_filter=None,
+    )
 
 
 def fit_linear_svm(
@@ -314,6 +427,29 @@ def save_condition_summaries(condition_df: pd.DataFrame, output_path: str) -> No
     condition_df.to_csv(output_path, index=False)
 
 
+def save_decoder_artifacts(
+    artifact_dir: str,
+    estimator: LinearSVC,
+    scaler: StandardScaler,
+    split_manifest: pd.DataFrame,
+    run_config: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> None:
+    os.makedirs(artifact_dir, exist_ok=True)
+    joblib.dump(
+        {
+            "estimator": estimator,
+            "scaler": scaler,
+            "metadata": metadata,
+        },
+        os.path.join(artifact_dir, "decoder_bundle.joblib"),
+    )
+    split_manifest.to_csv(os.path.join(artifact_dir, "split_manifest.csv"), index=False)
+    with open(os.path.join(artifact_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(run_config, f, indent=2)
+        f.write("\n")
+
+
 def _aggregate_condition_summary(trial_df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [
         "model_name",
@@ -337,6 +473,24 @@ def _aggregate_condition_summary(trial_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_split_manifest(metadata: pd.DataFrame, split: SplitSpec) -> pd.DataFrame:
+    manifest = metadata[["file_name", "mean", "sd", "ss", "instance"]].copy()
+    manifest["subset"] = "excluded"
+    manifest.loc[split.train_mask, "subset"] = "train"
+    manifest.loc[split.test_nonzero_mask, "subset"] = "test_nonzero"
+    manifest.loc[split.boundary_mask, "subset"] = "test_boundary_m0"
+    manifest["split_id"] = split.split_id
+    manifest["held_out_axis"] = split.held_out_axis
+    manifest["held_out_value"] = split.held_out_value
+    return manifest
+
+
+def _condition_filter_to_dict(condition_filter: Optional[ConditionFilter]) -> Optional[Dict[str, Any]]:
+    if condition_filter is None:
+        return None
+    return asdict(condition_filter)
+
+
 def run_layerwise_binary_decoding(
     dataset: EPGabors,
     model_name: str,
@@ -349,20 +503,26 @@ def run_layerwise_binary_decoding(
     num_workers: int = 0,
     svm_c: float = 1.0,
     random_state: int = 0,
+    selected_layer: str = "all",
+    train_filter: Optional[ConditionFilter] = None,
+    test_filter: Optional[ConditionFilter] = None,
+    save_artifacts: bool = True,
+    run_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Run full v1 decoding for one model and save outputs."""
+    """Run v1.1 decoding for one model and one layer or all mapped layers."""
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
     )
-    model, layer_map = get_model_and_layer_map(
+    model, full_layer_map = get_model_and_layer_map(
         model_name=model_name,
         pretrained=pretrained,
         source="timm",
         device=device,
     )
+    layer_map = select_layer_map(full_layer_map, selected_layer=selected_layer)
     layer_features, metadata = extract_layer_features(
         model=model,
         layer_map=layer_map,
@@ -379,10 +539,12 @@ def run_layerwise_binary_decoding(
         metadata["file_name"] = np.arange(len(metadata)).astype(str)
 
     metadata["target"] = (metadata["mean"] > 0).astype(int)
-    splits = build_cross_condition_splits(
+    splits = build_controlled_splits(
         metadata=metadata,
         split_mode=split_mode,
         holdout_values=holdout_values,
+        train_filter=train_filter,
+        test_filter=test_filter,
     )
 
     all_trials: List[pd.DataFrame] = []
@@ -453,11 +615,54 @@ def run_layerwise_binary_decoding(
                 }
             )
 
+            if save_artifacts:
+                artifact_dir = os.path.join(output_dir, model_name, layer_name, split.split_id)
+                split_manifest = _build_split_manifest(metadata, split)
+                effective_config = dict(run_config or {})
+                if not effective_config:
+                    effective_config = {}
+                effective_config.update(
+                    {
+                        "model_name": model_name,
+                        "layer_name": layer_name,
+                        "split_id": split.split_id,
+                        "held_out_axis": split.held_out_axis,
+                        "held_out_value": split.held_out_value,
+                        "split_mode": split_mode,
+                        "holdout_values": list(holdout_values) if holdout_values is not None else None,
+                        "pretrained": pretrained,
+                        "device": device,
+                        "batch_size": batch_size,
+                        "num_workers": num_workers,
+                        "svm_c": svm_c,
+                        "random_state": random_state,
+                        "train_filter": _condition_filter_to_dict(train_filter),
+                        "test_filter": _condition_filter_to_dict(test_filter),
+                    }
+                )
+                save_decoder_artifacts(
+                    artifact_dir=artifact_dir,
+                    estimator=svm_result["estimator"],
+                    scaler=svm_result["scaler"],
+                    split_manifest=split_manifest,
+                    run_config=effective_config,
+                    metadata={
+                        "model_name": model_name,
+                        "layer_name": layer_name,
+                        "split_id": split.split_id,
+                        "metrics": metric_rows[-1],
+                    },
+                )
+
+    if not metric_rows:
+        raise ValueError("No valid layer/split runs were produced. Check filters and split settings.")
+
     trial_df = pd.concat(all_trials, ignore_index=True)
     metrics_df = pd.DataFrame(metric_rows)
     condition_df = _aggregate_condition_summary(trial_df)
 
-    prefix = f"{model_name}_{split_mode}"
+    layer_label = selected_layer if selected_layer != "all" else "all_layers"
+    prefix = f"{model_name}_{layer_label}_{split_mode}"
     save_trial_outputs(trial_df, os.path.join(output_dir, f"{prefix}_trial_outputs.csv"))
     save_condition_summaries(
         condition_df, os.path.join(output_dir, f"{prefix}_condition_summary.csv")
@@ -483,8 +688,12 @@ def run_default_v1_panel(
     random_state: int = 0,
     include_single: bool = False,
     include_zerovar: bool = False,
+    selected_layer: str = "all",
+    train_filter: Optional[ConditionFilter] = None,
+    test_filter: Optional[ConditionFilter] = None,
+    save_artifacts: bool = True,
 ) -> Dict[str, pd.DataFrame]:
-    """Run v1 defaults over the selected model panel."""
+    """Run v1 defaults over a selected model panel."""
     transform = make_deterministic_transform(input_size=input_size)
     dataset = EPGabors(
         img_dir=img_dir,
@@ -511,27 +720,71 @@ def run_default_v1_panel(
             num_workers=num_workers,
             svm_c=svm_c,
             random_state=random_state,
+            selected_layer=selected_layer,
+            train_filter=train_filter,
+            test_filter=test_filter,
+            save_artifacts=save_artifacts,
+            run_config={
+                "mode": "panel",
+                "selected_layer": selected_layer,
+                "split_mode": split_mode,
+                "holdout_values": list(holdout_values) if holdout_values is not None else None,
+                "input_size": input_size,
+                "pretrained": pretrained,
+                "device": device,
+                "batch_size": batch_size,
+                "num_workers": num_workers,
+                "svm_c": svm_c,
+                "random_state": random_state,
+                "include_single": include_single,
+                "include_zerovar": include_zerovar,
+                "train_filter": _condition_filter_to_dict(train_filter),
+                "test_filter": _condition_filter_to_dict(test_filter),
+            },
         )
         metrics_outputs[model_name] = metrics_df
     return metrics_outputs
 
 
-def _parse_holdout_values(raw: str) -> Optional[List[int]]:
+def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
     if raw is None or raw.strip() == "":
         return None
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
 
+def _condition_filter_from_args(args: argparse.Namespace, prefix: str) -> Optional[ConditionFilter]:
+    data = ConditionFilter(
+        means=_parse_int_list(getattr(args, f"{prefix}_means", None)),
+        sds=_parse_int_list(getattr(args, f"{prefix}_sds", None)),
+        sss=_parse_int_list(getattr(args, f"{prefix}_sss", None)),
+        instances=_parse_int_list(getattr(args, f"{prefix}_instances", None)),
+        exclude_means=_parse_int_list(getattr(args, f"exclude_{prefix}_means", None)),
+        exclude_sds=_parse_int_list(getattr(args, f"exclude_{prefix}_sds", None)),
+        exclude_sss=_parse_int_list(getattr(args, f"exclude_{prefix}_sss", None)),
+        exclude_instances=_parse_int_list(getattr(args, f"exclude_{prefix}_instances", None)),
+    )
+    if all(value is None for value in asdict(data).values()):
+        return None
+    return data
+
+
+def _print_layer_listing(model_name: str) -> None:
+    layer_df = list_available_layers(model_name)
+    print(layer_df.to_string(index=False))
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run EPGabor CNN layerwise decoding v1.")
+    parser = argparse.ArgumentParser(description="Run EPGabor CNN layerwise decoding v1.1.")
     parser.add_argument("--img-dir", type=str, default="images")
     parser.add_argument("--output-dir", type=str, default="results_v1")
-    parser.add_argument("--models", type=str, default=",".join(DEFAULT_MODEL_NAMES))
+    parser.add_argument("--model-name", type=str, default="resnet50")
+    parser.add_argument("--layer-name", type=str, default="all")
+    parser.add_argument("--list-layers", action="store_true", default=False)
     parser.add_argument(
         "--split-mode",
         type=str,
         default="leave_one_sd_out",
-        choices=["leave_one_sd_out", "leave_one_ss_out"],
+        choices=["leave_one_sd_out", "leave_one_ss_out", "explicit"],
     )
     parser.add_argument("--holdout-values", type=str, default=None)
     parser.add_argument("--input-size", type=int, default=224)
@@ -548,16 +801,89 @@ def main() -> None:
     )
     parser.add_argument("--include-single", action="store_true", default=False)
     parser.add_argument("--include-zerovar", action="store_true", default=False)
+    parser.add_argument(
+        "--save-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save decoder bundle, split manifest, and run config (default: True).",
+    )
+
+    parser.add_argument("--dataset-means", type=str, default=None)
+    parser.add_argument("--dataset-sds", type=str, default=None)
+    parser.add_argument("--dataset-sss", type=str, default=None)
+    parser.add_argument("--dataset-instances", type=str, default=None)
+
+    parser.add_argument("--train-means", type=str, default=None)
+    parser.add_argument("--train-sds", type=str, default=None)
+    parser.add_argument("--train-sss", type=str, default=None)
+    parser.add_argument("--train-instances", type=str, default=None)
+    parser.add_argument("--exclude-train-means", type=str, default=None)
+    parser.add_argument("--exclude-train-sds", type=str, default=None)
+    parser.add_argument("--exclude-train-sss", type=str, default=None)
+    parser.add_argument("--exclude-train-instances", type=str, default=None)
+
+    parser.add_argument("--test-means", type=str, default=None)
+    parser.add_argument("--test-sds", type=str, default=None)
+    parser.add_argument("--test-sss", type=str, default=None)
+    parser.add_argument("--test-instances", type=str, default=None)
+    parser.add_argument("--exclude-test-means", type=str, default=None)
+    parser.add_argument("--exclude-test-sds", type=str, default=None)
+    parser.add_argument("--exclude-test-sss", type=str, default=None)
+    parser.add_argument("--exclude-test-instances", type=str, default=None)
+
     args = parser.parse_args()
 
-    model_names = [m.strip() for m in args.models.split(",") if m.strip()]
-    holdout_values = _parse_holdout_values(args.holdout_values)
+    if args.list_layers:
+        _print_layer_listing(args.model_name)
+        return
 
-    run_default_v1_panel(
+    dataset = EPGabors(
         img_dir=args.img_dir,
+        include_vertical=True,
+        include_single=args.include_single,
+        include_zerovar=args.include_zerovar,
+        filter_mean=_parse_int_list(args.dataset_means),
+        filter_sd=_parse_int_list(args.dataset_sds),
+        filter_ss=_parse_int_list(args.dataset_sss),
+        filter_instance=_parse_int_list(args.dataset_instances),
+        transform=make_deterministic_transform(input_size=args.input_size),
+        return_filename=True,
+        return_condition_id=True,
+    )
+
+    holdout_values = _parse_int_list(args.holdout_values)
+    train_filter = _condition_filter_from_args(args, "train")
+    test_filter = _condition_filter_from_args(args, "test")
+
+    run_config = {
+        "model_name": args.model_name,
+        "layer_name": args.layer_name,
+        "split_mode": args.split_mode,
+        "holdout_values": holdout_values,
+        "input_size": args.input_size,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "device": args.device,
+        "svm_c": args.svm_c,
+        "random_state": args.random_state,
+        "pretrained": args.pretrained,
+        "include_single": args.include_single,
+        "include_zerovar": args.include_zerovar,
+        "save_artifacts": args.save_artifacts,
+        "dataset_filters": {
+            "means": _parse_int_list(args.dataset_means),
+            "sds": _parse_int_list(args.dataset_sds),
+            "sss": _parse_int_list(args.dataset_sss),
+            "instances": _parse_int_list(args.dataset_instances),
+        },
+        "train_filter": _condition_filter_to_dict(train_filter),
+        "test_filter": _condition_filter_to_dict(test_filter),
+    }
+
+    run_layerwise_binary_decoding(
+        dataset=dataset,
+        model_name=args.model_name,
         output_dir=args.output_dir,
-        models=model_names,
-        input_size=args.input_size,
         split_mode=args.split_mode,
         holdout_values=holdout_values,
         pretrained=args.pretrained,
@@ -566,8 +892,11 @@ def main() -> None:
         num_workers=args.num_workers,
         svm_c=args.svm_c,
         random_state=args.random_state,
-        include_single=args.include_single,
-        include_zerovar=args.include_zerovar,
+        selected_layer=args.layer_name,
+        train_filter=train_filter,
+        test_filter=test_filter,
+        save_artifacts=args.save_artifacts,
+        run_config=run_config,
     )
 
 
