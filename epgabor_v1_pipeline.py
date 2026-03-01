@@ -1,19 +1,21 @@
-"""v1.1 pipeline for layerwise mean-orientation decoding in pretrained CNNs."""
+"""Research-first ResNet50 decoding pipeline for EP Gabor images."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import time
+import warnings
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 import timm
 import torch
-from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, roc_auc_score
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 from torch.utils.data import DataLoader
@@ -22,33 +24,94 @@ from torchvision import transforms
 from EPOriGabors import EPGabors
 
 
-DEFAULT_MODEL_NAMES = ["resnet50", "convnext_tiny", "efficientnet_b0", "vgg16_bn"]
+SPARSE_LAYER_PATHS = {
+    "stem": "maxpool",
+    "layer1_last": "layer1.2",
+    "layer2_last": "layer2.3",
+    "layer3_last": "layer3.5",
+    "layer4_last": "layer4.2",
+}
+
+TRIAL_COLUMNS = [
+    "fold_id",
+    "layer_name",
+    "file_name",
+    "condition_id",
+    "mean",
+    "sd",
+    "ss",
+    "instance",
+    "target",
+    "pred_class",
+    "decision_value",
+    "correct",
+    "decoder_name",
+]
+
+FOLD_METRIC_COLUMNS = [
+    "layer_name",
+    "fold_id",
+    "train_n",
+    "test_n",
+    "accuracy",
+    "balanced_accuracy",
+    "f1",
+    "auroc",
+    "decoder_name",
+]
+
+LAYER_SUMMARY_COLUMNS = [
+    "layer_name",
+    "n_folds",
+    "total_test_n",
+    "accuracy_mean",
+    "accuracy_std",
+    "balanced_accuracy_mean",
+    "balanced_accuracy_std",
+    "f1_mean",
+    "f1_std",
+    "auroc_mean",
+    "auroc_std",
+    "decoder_name",
+]
+
+BOUNDARY_TRIAL_COLUMNS = [
+    "fold_id",
+    "layer_name",
+    "file_name",
+    "condition_id",
+    "mean",
+    "sd",
+    "ss",
+    "instance",
+    "pred_class",
+    "decision_value",
+    "choice_cw",
+    "decoder_name",
+]
+
+BOUNDARY_SUMMARY_COLUMNS = [
+    "layer_name",
+    "fold_id",
+    "boundary_n",
+    "cw_rate",
+    "decision_value_mean",
+    "decision_value_std",
+    "decoder_name",
+]
+
+TIMING_COLUMNS = ["stage", "layer_name", "fold_id", "seconds"]
 
 
 @dataclass
-class SplitSpec:
-    split_id: str
-    train_mask: np.ndarray
-    test_nonzero_mask: np.ndarray
-    boundary_mask: np.ndarray
-    held_out_axis: str
-    held_out_value: Any
-
-
-@dataclass
-class ConditionFilter:
-    means: Optional[List[int]] = None
-    sds: Optional[List[int]] = None
-    sss: Optional[List[int]] = None
-    instances: Optional[List[int]] = None
-    exclude_means: Optional[List[int]] = None
-    exclude_sds: Optional[List[int]] = None
-    exclude_sss: Optional[List[int]] = None
-    exclude_instances: Optional[List[int]] = None
+class FoldSpec:
+    fold_id: str
+    train_idx: np.ndarray
+    test_idx: np.ndarray
 
 
 def make_deterministic_transform(input_size: int = 224) -> transforms.Compose:
-    """Deterministic preprocessing without crop/rotation/augmentation."""
+    """Deterministic preprocessing without augmentation."""
     return transforms.Compose(
         [
             transforms.ToTensor(),
@@ -61,51 +124,14 @@ def make_deterministic_transform(input_size: int = 224) -> transforms.Compose:
     )
 
 
-def _get_layer_path_map(model_name: str) -> Dict[str, str]:
-    if model_name == "resnet50":
-        return {
-            "stem": "maxpool",
-            "stage1": "layer1",
-            "stage2": "layer2",
-            "stage3": "layer3",
-            "stage4": "layer4",
-        }
-    if model_name == "convnext_tiny":
-        return {
-            "stem": "stem",
-            "stage1": "stages.0",
-            "stage2": "stages.1",
-            "stage3": "stages.2",
-            "stage4": "stages.3",
-        }
-    if model_name == "efficientnet_b0":
-        return {
-            "stem": "bn1",
-            "stage1": "blocks.1",
-            "stage2": "blocks.2",
-            "stage3": "blocks.4",
-            "stage4": "blocks.6",
-            "head": "bn2",
-        }
-    if model_name == "vgg16_bn":
-        return {
-            "stage1": "features.6",
-            "stage2": "features.13",
-            "stage3": "features.23",
-            "stage4": "features.33",
-            "stage5": "features.43",
-        }
-    raise ValueError(f"Unsupported model_name: {model_name}")
+def list_available_layers(model_name: str = "resnet50") -> pd.DataFrame:
+    """List the sparse ResNet50 endpoints exposed by the pipeline."""
+    if model_name != "resnet50":
+        raise ValueError("Only 'resnet50' is supported in this pipeline.")
 
-
-def list_available_layers(model_name: str, source: str = "timm") -> pd.DataFrame:
-    """List pipeline-facing layer names and the underlying module paths."""
-    if source != "timm":
-        raise ValueError(f"Unsupported source: {source}")
-
-    model = timm.create_model(model_name, pretrained=False)
+    model = timm.create_model("resnet50", pretrained=False)
     rows = []
-    for layer_name, module_path in _get_layer_path_map(model_name).items():
+    for layer_name, module_path in SPARSE_LAYER_PATHS.items():
         module = model.get_submodule(module_path)
         rows.append(
             {
@@ -117,35 +143,39 @@ def list_available_layers(model_name: str, source: str = "timm") -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
+def get_resnet50_sparse_layer_map(
+    pretrained: bool = True,
+    device: str = "cpu",
+) -> Tuple[torch.nn.Module, Dict[str, torch.nn.Module]]:
+    """Return a ResNet50 model and the sparse endpoint module map."""
+    model = timm.create_model("resnet50", pretrained=pretrained)
+    model.eval().to(device)
+
+    layer_map: Dict[str, torch.nn.Module] = {}
+    for layer_name, module_path in SPARSE_LAYER_PATHS.items():
+        layer_map[layer_name] = model.get_submodule(module_path)
+    return model, layer_map
+
+
 def get_model_and_layer_map(
     model_name: str,
     pretrained: bool = True,
     source: str = "timm",
     device: str = "cpu",
 ) -> Tuple[torch.nn.Module, Dict[str, torch.nn.Module]]:
-    """Return model and stage-end layer modules for feature extraction."""
+    """Backward-compatible wrapper for the prior API."""
     if source != "timm":
-        raise ValueError(f"Unsupported source: {source}")
-
-    model = timm.create_model(model_name, pretrained=pretrained)
-    model.eval().to(device)
-
-    path_map = _get_layer_path_map(model_name)
-    layer_map: Dict[str, torch.nn.Module] = {}
-    for layer_name, module_path in path_map.items():
-        try:
-            layer_map[layer_name] = model.get_submodule(module_path)
-        except AttributeError as exc:
-            raise ValueError(
-                f"Could not resolve module path '{module_path}' for '{model_name}'."
-            ) from exc
-    return model, layer_map
+        raise ValueError("Only 'timm' is supported.")
+    if model_name != "resnet50":
+        raise ValueError("Only 'resnet50' is supported in this pipeline.")
+    return get_resnet50_sparse_layer_map(pretrained=pretrained, device=device)
 
 
 def select_layer_map(
     layer_map: Dict[str, torch.nn.Module],
     selected_layer: str = "all",
 ) -> Dict[str, torch.nn.Module]:
+    """Select one sparse endpoint or all available endpoints."""
     if selected_layer == "all":
         return dict(layer_map)
     if selected_layer not in layer_map:
@@ -154,16 +184,11 @@ def select_layer_map(
     return {selected_layer: layer_map[selected_layer]}
 
 
-def _pool_activation(activation: torch.Tensor, pooling: str = "gap") -> torch.Tensor:
-    if pooling != "gap":
-        raise ValueError(f"Unsupported pooling mode: {pooling}")
-
-    if activation.ndim == 2:
-        return activation
-    if activation.ndim == 3:
-        return activation.mean(dim=1)
-    if activation.ndim == 4:
-        return activation.mean(dim=(2, 3))
+def _flatten_activation(activation: torch.Tensor, feature_mode: str = "flatten") -> torch.Tensor:
+    if feature_mode != "flatten":
+        raise ValueError(f"Unsupported feature_mode: {feature_mode}")
+    if activation.ndim < 2:
+        raise ValueError(f"Expected activation with ndim >= 2, got {activation.ndim}")
     return activation.flatten(start_dim=1)
 
 
@@ -185,9 +210,9 @@ def extract_layer_features(
     layer_map: Dict[str, torch.nn.Module],
     dataloader: DataLoader,
     device: str = "cpu",
-    pooling: str = "gap",
+    feature_mode: str = "flatten",
 ) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
-    """Extract pooled layer features for all samples in a dataloader."""
+    """Extract flattened endpoint activations for all samples in a dataloader."""
     batch_features = {layer_name: [] for layer_name in layer_map}
     label_batches: List[Dict] = []
     activations: Dict[str, torch.Tensor] = {}
@@ -210,8 +235,8 @@ def extract_layer_features(
                 _ = model(images)
 
                 for layer_name in layer_map:
-                    pooled = _pool_activation(activations[layer_name], pooling=pooling)
-                    batch_features[layer_name].append(pooled.detach().cpu().numpy())
+                    flattened = _flatten_activation(activations[layer_name], feature_mode=feature_mode)
+                    batch_features[layer_name].append(flattened.detach().cpu().numpy())
 
                 label_batches.append(labels)
     finally:
@@ -226,110 +251,105 @@ def extract_layer_features(
     return layer_features, metadata
 
 
-def _eligible_mask(metadata: pd.DataFrame, condition_filter: Optional[ConditionFilter]) -> np.ndarray:
-    mask = np.ones(len(metadata), dtype=bool)
-    if condition_filter is None:
-        return mask
+def build_stratified_kfold_splits(
+    labels: np.ndarray,
+    n_splits: int = 5,
+    shuffle: bool = True,
+    random_state: int = 0,
+) -> List[FoldSpec]:
+    """Build stratified K-fold splits from a label vector."""
+    labels = np.asarray(labels)
+    if labels.ndim != 1:
+        raise ValueError("labels must be a 1D array")
+    if len(labels) == 0:
+        raise ValueError("labels must contain at least one sample")
 
-    if condition_filter.means is not None:
-        mask &= metadata["mean"].isin(condition_filter.means).to_numpy()
-    if condition_filter.sds is not None:
-        mask &= metadata["sd"].isin(condition_filter.sds).to_numpy()
-    if condition_filter.sss is not None:
-        mask &= metadata["ss"].isin(condition_filter.sss).to_numpy()
-    if condition_filter.instances is not None:
-        mask &= metadata["instance"].isin(condition_filter.instances).to_numpy()
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if len(unique_labels) < 2:
+        raise ValueError("At least two classes are required for stratified K-fold.")
+    if counts.min() < n_splits:
+        raise ValueError(
+            f"Each class must contain at least {n_splits} samples, got counts {counts.tolist()}."
+        )
 
-    if condition_filter.exclude_means is not None:
-        mask &= ~metadata["mean"].isin(condition_filter.exclude_means).to_numpy()
-    if condition_filter.exclude_sds is not None:
-        mask &= ~metadata["sd"].isin(condition_filter.exclude_sds).to_numpy()
-    if condition_filter.exclude_sss is not None:
-        mask &= ~metadata["ss"].isin(condition_filter.exclude_sss).to_numpy()
-    if condition_filter.exclude_instances is not None:
-        mask &= ~metadata["instance"].isin(condition_filter.exclude_instances).to_numpy()
+    splitter = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=shuffle,
+        random_state=random_state,
+    )
 
-    return mask
-
-
-def build_controlled_splits(
-    metadata: pd.DataFrame,
-    split_mode: str = "leave_one_sd_out",
-    holdout_values: Optional[Iterable[int]] = None,
-    train_filter: Optional[ConditionFilter] = None,
-    test_filter: Optional[ConditionFilter] = None,
-) -> List[SplitSpec]:
-    """Build train/test masks with explicit eligibility control."""
-    train_eligible = _eligible_mask(metadata, train_filter)
-    test_eligible = _eligible_mask(metadata, test_filter)
-
-    mean_values = metadata["mean"].to_numpy()
-
-    if split_mode == "explicit":
-        train_mask = train_eligible & (mean_values != 0)
-        test_nonzero_mask = test_eligible & (mean_values != 0)
-        boundary_mask = test_eligible & (mean_values == 0)
-        if np.any(train_mask & test_nonzero_mask) or np.any(train_mask & boundary_mask):
-            raise ValueError("Explicit train/test filters overlap. Make them disjoint.")
-        return [
-            SplitSpec(
-                split_id="explicit",
-                train_mask=train_mask,
-                test_nonzero_mask=test_nonzero_mask,
-                boundary_mask=boundary_mask,
-                held_out_axis="explicit",
-                held_out_value="explicit",
-            )
-        ]
-
-    if split_mode not in {"leave_one_sd_out", "leave_one_ss_out"}:
-        raise ValueError(f"Unsupported split_mode: {split_mode}")
-
-    axis = "sd" if split_mode == "leave_one_sd_out" else "ss"
-    if holdout_values is None:
-        holdout_values = sorted(int(v) for v in metadata[axis].unique())
-    else:
-        holdout_values = [int(v) for v in holdout_values]
-
-    axis_values = metadata[axis].to_numpy()
-    splits: List[SplitSpec] = []
-    for value in holdout_values:
-        in_holdout = axis_values == value
-        train_mask = train_eligible & (~in_holdout) & (mean_values != 0)
-        test_nonzero_mask = test_eligible & in_holdout & (mean_values != 0)
-        boundary_mask = test_eligible & in_holdout & (mean_values == 0)
-
-        if np.any(train_mask & test_nonzero_mask) or np.any(train_mask & boundary_mask):
-            raise ValueError(
-                f"Train/test overlap detected for split {axis}{value}. Check filters."
-            )
-
+    splits = []
+    dummy = np.zeros(len(labels))
+    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(dummy, labels), start=1):
         splits.append(
-            SplitSpec(
-                split_id=f"{axis}{value}",
-                train_mask=train_mask,
-                test_nonzero_mask=test_nonzero_mask,
-                boundary_mask=boundary_mask,
-                held_out_axis=axis,
-                held_out_value=value,
+            FoldSpec(
+                fold_id=f"fold{fold_idx}",
+                train_idx=train_idx,
+                test_idx=test_idx,
             )
         )
     return splits
 
 
-def build_cross_condition_splits(
-    metadata: pd.DataFrame,
-    split_mode: str = "leave_one_sd_out",
-    holdout_values: Optional[Iterable[int]] = None,
-) -> List[SplitSpec]:
-    """Backward-compatible wrapper around the controlled split builder."""
-    return build_controlled_splits(
-        metadata=metadata,
-        split_mode=split_mode,
-        holdout_values=holdout_values,
-        train_filter=None,
-        test_filter=None,
-    )
+def fit_linear_decoder(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    decoder_name: str = "linear_svc",
+    svm_c: float = 1.0,
+    sgd_alpha: float = 0.0001,
+    max_iter: int = 1000,
+    tol: float = 1e-3,
+    random_state: int = 0,
+) -> Dict[str, object]:
+    """Fit a linear classifier and evaluate it on held-out data."""
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    if decoder_name == "linear_svc":
+        estimator = LinearSVC(
+            C=svm_c,
+            class_weight="balanced",
+            random_state=random_state,
+            max_iter=max_iter,
+            dual="auto",
+        )
+    elif decoder_name == "sgd_hinge":
+        estimator = SGDClassifier(
+            loss="hinge",
+            penalty="l2",
+            alpha=sgd_alpha,
+            max_iter=max_iter,
+            tol=tol,
+            class_weight="balanced",
+            random_state=random_state,
+        )
+    else:
+        raise ValueError(f"Unsupported decoder_name: {decoder_name}")
+
+    estimator.fit(X_train_scaled, y_train)
+    y_pred = estimator.predict(X_test_scaled)
+    decision_value = np.asarray(estimator.decision_function(X_test_scaled)).reshape(-1)
+
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+        "f1": float(f1_score(y_test, y_pred)),
+    }
+    if len(np.unique(y_test)) == 2:
+        metrics["auroc"] = float(roc_auc_score(y_test, decision_value))
+    else:
+        metrics["auroc"] = np.nan
+
+    return {
+        "estimator": estimator,
+        "scaler": scaler,
+        "y_pred": y_pred,
+        "decision_value": decision_value,
+        "metrics": metrics,
+    }
 
 
 def fit_linear_svm(
@@ -339,411 +359,378 @@ def fit_linear_svm(
     y_test: np.ndarray,
     C: float = 1.0,
     random_state: int = 0,
-    max_iter: int = 10000,
-) -> Dict:
-    """Train/evaluate a LinearSVC with train-only feature scaling."""
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    svm = LinearSVC(
-        C=C,
-        class_weight="balanced",
-        random_state=random_state,
+    max_iter: int = 1000,
+) -> Dict[str, object]:
+    """Backward-compatible SVM wrapper around the unified decoder API."""
+    result = fit_linear_decoder(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        decoder_name="linear_svc",
+        svm_c=C,
         max_iter=max_iter,
-        dual="auto",
+        random_state=random_state,
     )
-    svm.fit(X_train_scaled, y_train)
-
-    y_pred = svm.predict(X_test_scaled)
-    margins = svm.decision_function(X_test_scaled)
-
-    metrics = {
-        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-        "f1": float(f1_score(y_test, y_pred)),
-        "confusion_matrix": confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist(),
-    }
-    if len(np.unique(y_test)) == 2:
-        metrics["auroc"] = float(roc_auc_score(y_test, margins))
-    else:
-        metrics["auroc"] = np.nan
-
     return {
-        "estimator": svm,
-        "scaler": scaler,
-        "y_pred": y_pred,
-        "margins": margins,
-        "metrics": metrics,
+        "estimator": result["estimator"],
+        "scaler": result["scaler"],
+        "y_pred": result["y_pred"],
+        "margins": result["decision_value"],
+        "metrics": {
+            "balanced_accuracy": result["metrics"]["balanced_accuracy"],
+            "f1": result["metrics"]["f1"],
+            "auroc": result["metrics"]["auroc"],
+        },
     }
 
 
-def evaluate_boundary_m0(
-    estimator: LinearSVC,
+def evaluate_vertical_boundary(
+    estimator,
     scaler: StandardScaler,
-    X_boundary: np.ndarray,
-    metadata_boundary: pd.DataFrame,
+    X_vertical: np.ndarray,
+    metadata_vertical: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """Evaluate m=0 boundary cases using SVM hyperplane distance."""
-    if len(X_boundary) == 0:
-        empty_cols = list(metadata_boundary.columns) + ["pred_class", "margin", "choice_cw"]
-        return pd.DataFrame(columns=empty_cols), {
+    """Apply a trained fold model to vertical (mean=0) images."""
+    if len(X_vertical) == 0:
+        return pd.DataFrame(columns=BOUNDARY_TRIAL_COLUMNS), {
             "boundary_n": 0.0,
-            "boundary_cw_rate": np.nan,
-            "boundary_margin_mean": np.nan,
-            "boundary_margin_std": np.nan,
+            "cw_rate": np.nan,
+            "decision_value_mean": np.nan,
+            "decision_value_std": np.nan,
         }
 
-    X_boundary_scaled = scaler.transform(X_boundary)
-    pred = estimator.predict(X_boundary_scaled)
-    margins = estimator.decision_function(X_boundary_scaled)
+    X_vertical_scaled = scaler.transform(X_vertical)
+    pred = estimator.predict(X_vertical_scaled)
+    decision_value = np.asarray(estimator.decision_function(X_vertical_scaled)).reshape(-1)
 
-    boundary_trials = metadata_boundary.copy()
+    boundary_trials = metadata_vertical.copy()
     boundary_trials["pred_class"] = pred.astype(int)
-    boundary_trials["margin"] = margins.astype(float)
+    boundary_trials["decision_value"] = decision_value.astype(float)
     boundary_trials["choice_cw"] = (boundary_trials["pred_class"] == 1).astype(int)
 
     summary = {
         "boundary_n": float(len(boundary_trials)),
-        "boundary_cw_rate": float(boundary_trials["choice_cw"].mean()),
-        "boundary_margin_mean": float(boundary_trials["margin"].mean()),
-        "boundary_margin_std": float(boundary_trials["margin"].std(ddof=1))
+        "cw_rate": float(boundary_trials["choice_cw"].mean()),
+        "decision_value_mean": float(boundary_trials["decision_value"].mean()),
+        "decision_value_std": float(boundary_trials["decision_value"].std(ddof=1))
         if len(boundary_trials) > 1
         else 0.0,
     }
     return boundary_trials, summary
 
 
-def save_trial_outputs(trial_df: pd.DataFrame, output_path: str) -> None:
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    trial_df.to_csv(output_path, index=False)
+def _ensure_metadata_columns(metadata: pd.DataFrame) -> pd.DataFrame:
+    required = {"mean", "sd", "ss", "instance"}
+    missing = required - set(metadata.columns)
+    if missing:
+        raise ValueError(f"Metadata is missing required columns: {missing}")
 
-
-def save_condition_summaries(condition_df: pd.DataFrame, output_path: str) -> None:
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    condition_df.to_csv(output_path, index=False)
-
-
-def save_decoder_artifacts(
-    artifact_dir: str,
-    estimator: LinearSVC,
-    scaler: StandardScaler,
-    split_manifest: pd.DataFrame,
-    run_config: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> None:
-    os.makedirs(artifact_dir, exist_ok=True)
-    joblib.dump(
-        {
-            "estimator": estimator,
-            "scaler": scaler,
-            "metadata": metadata,
-        },
-        os.path.join(artifact_dir, "decoder_bundle.joblib"),
-    )
-    split_manifest.to_csv(os.path.join(artifact_dir, "split_manifest.csv"), index=False)
-    with open(os.path.join(artifact_dir, "run_config.json"), "w", encoding="utf-8") as f:
-        json.dump(run_config, f, indent=2)
-        f.write("\n")
-
-
-def _aggregate_condition_summary(trial_df: pd.DataFrame) -> pd.DataFrame:
-    group_cols = [
-        "model_name",
-        "layer_name",
-        "split_id",
-        "subset",
-        "mean",
-        "sd",
-        "ss",
-    ]
-    out = (
-        trial_df.groupby(group_cols, dropna=False)
-        .agg(
-            n=("choice_cw", "size"),
-            cw_rate=("choice_cw", "mean"),
-            margin_mean=("margin", "mean"),
-            margin_std=("margin", "std"),
+    metadata = metadata.copy()
+    if "file_name" not in metadata.columns:
+        metadata["file_name"] = np.arange(len(metadata)).astype(str)
+    if "condition_id" not in metadata.columns:
+        metadata["condition_id"] = metadata.apply(
+            lambda row: f"m{int(row['mean'])}_sd{int(row['sd'])}_ss{int(row['ss'])}",
+            axis=1,
         )
-        .reset_index()
-    )
-    return out
+    return metadata
 
 
-def _build_split_manifest(metadata: pd.DataFrame, split: SplitSpec) -> pd.DataFrame:
-    manifest = metadata[["file_name", "mean", "sd", "ss", "instance"]].copy()
-    manifest["subset"] = "excluded"
-    manifest.loc[split.train_mask, "subset"] = "train"
-    manifest.loc[split.test_nonzero_mask, "subset"] = "test_nonzero"
-    manifest.loc[split.boundary_mask, "subset"] = "test_boundary_m0"
-    manifest["split_id"] = split.split_id
-    manifest["held_out_axis"] = split.held_out_axis
-    manifest["held_out_value"] = split.held_out_value
-    return manifest
+def _estimate_dense_bytes(array: np.ndarray) -> int:
+    return int(np.prod(array.shape) * array.dtype.itemsize)
 
 
-def _condition_filter_to_dict(condition_filter: Optional[ConditionFilter]) -> Optional[Dict[str, Any]]:
-    if condition_filter is None:
-        return None
-    return asdict(condition_filter)
+def _warn_if_large_dense_matrix(array: np.ndarray, decoder_name: str) -> None:
+    if decoder_name != "linear_svc":
+        return
+    dense_bytes = _estimate_dense_bytes(array)
+    if dense_bytes >= 1_000_000_000:
+        size_gb = dense_bytes / 1_000_000_000
+        warnings.warn(
+            (
+                f"Feature matrix is approximately {size_gb:.2f} GB before scaling. "
+                "Consider using decoder_name='sgd_hinge' if memory becomes a bottleneck."
+            ),
+            RuntimeWarning,
+        )
 
 
-def run_layerwise_binary_decoding(
+def _aggregate_layer_summary(fold_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if fold_metrics_df.empty:
+        return pd.DataFrame(columns=LAYER_SUMMARY_COLUMNS)
+
+    rows = []
+    for layer_name, group in fold_metrics_df.groupby("layer_name", sort=False):
+        rows.append(
+            {
+                "layer_name": layer_name,
+                "n_folds": int(len(group)),
+                "total_test_n": int(group["test_n"].sum()),
+                "accuracy_mean": float(group["accuracy"].mean()),
+                "accuracy_std": float(group["accuracy"].std(ddof=1)) if len(group) > 1 else 0.0,
+                "balanced_accuracy_mean": float(group["balanced_accuracy"].mean()),
+                "balanced_accuracy_std": float(group["balanced_accuracy"].std(ddof=1))
+                if len(group) > 1
+                else 0.0,
+                "f1_mean": float(group["f1"].mean()),
+                "f1_std": float(group["f1"].std(ddof=1)) if len(group) > 1 else 0.0,
+                "auroc_mean": float(group["auroc"].mean()),
+                "auroc_std": float(group["auroc"].std(ddof=1)) if len(group) > 1 else 0.0,
+                "decoder_name": group["decoder_name"].iloc[0],
+            }
+        )
+    return pd.DataFrame(rows, columns=LAYER_SUMMARY_COLUMNS)
+
+
+def _save_dataframe(df: pd.DataFrame, output_path: str) -> None:
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    df.to_csv(output_path, index=False)
+
+
+def run_resnet50_kfold_decoding(
     dataset: EPGabors,
-    model_name: str,
     output_dir: str,
-    split_mode: str = "leave_one_sd_out",
-    holdout_values: Optional[Iterable[int]] = None,
+    selected_layer: str = "all",
+    decoder_name: str = "linear_svc",
+    n_splits: int = 5,
     pretrained: bool = True,
     device: str = "cpu",
-    batch_size: int = 64,
+    batch_size: int = 32,
     num_workers: int = 0,
-    svm_c: float = 1.0,
     random_state: int = 0,
-    selected_layer: str = "all",
-    train_filter: Optional[ConditionFilter] = None,
-    test_filter: Optional[ConditionFilter] = None,
-    save_artifacts: bool = True,
-    run_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Run v1.1 decoding for one model and one layer or all mapped layers."""
+    svm_c: float = 1.0,
+    sgd_alpha: float = 0.0001,
+    max_iter: int = 1000,
+    tol: float = 1e-3,
+    evaluate_vertical: bool = True,
+    measure_timing: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run sparse-endpoint ResNet50 decoding with K-fold CV."""
+    total_start = time.perf_counter() if measure_timing else None
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
     )
-    model, full_layer_map = get_model_and_layer_map(
-        model_name=model_name,
+
+    model, full_layer_map = get_resnet50_sparse_layer_map(
         pretrained=pretrained,
-        source="timm",
         device=device,
     )
-    layer_map = select_layer_map(full_layer_map, selected_layer=selected_layer)
-    layer_features, metadata = extract_layer_features(
-        model=model,
-        layer_map=layer_map,
-        dataloader=dataloader,
-        device=device,
-        pooling="gap",
-    )
+    selected_layer_map = select_layer_map(full_layer_map, selected_layer=selected_layer)
 
-    required_cols = {"mean", "sd", "ss", "instance"}
-    missing = required_cols - set(metadata.columns)
-    if missing:
-        raise ValueError(f"Metadata is missing columns: {missing}")
-    if "file_name" not in metadata.columns:
-        metadata["file_name"] = np.arange(len(metadata)).astype(str)
+    timing_rows: List[Dict[str, object]] = []
+    trial_rows: List[pd.DataFrame] = []
+    fold_metric_rows: List[Dict[str, object]] = []
+    boundary_rows: List[pd.DataFrame] = []
+    boundary_summary_rows: List[Dict[str, object]] = []
+    feature_time_seconds = 0.0
 
-    metadata["target"] = (metadata["mean"] > 0).astype(int)
-    splits = build_controlled_splits(
-        metadata=metadata,
-        split_mode=split_mode,
-        holdout_values=holdout_values,
-        train_filter=train_filter,
-        test_filter=test_filter,
-    )
+    metadata: Optional[pd.DataFrame] = None
+    metadata_nonzero: Optional[pd.DataFrame] = None
+    metadata_vertical: Optional[pd.DataFrame] = None
+    nonzero_mask: Optional[np.ndarray] = None
+    vertical_mask: Optional[np.ndarray] = None
+    y_nonzero: Optional[np.ndarray] = None
+    folds: Optional[List[FoldSpec]] = None
 
-    all_trials: List[pd.DataFrame] = []
-    metric_rows: List[Dict] = []
+    for layer_name, module in selected_layer_map.items():
+        layer_start = time.perf_counter() if measure_timing else None
 
-    for split in splits:
-        for layer_name, X in layer_features.items():
-            train_idx = split.train_mask
-            test_idx = split.test_nonzero_mask
-            boundary_idx = split.boundary_mask
+        feature_start = time.perf_counter() if measure_timing else None
+        layer_features, layer_metadata = extract_layer_features(
+            model=model,
+            layer_map={layer_name: module},
+            dataloader=dataloader,
+            device=device,
+            feature_mode="flatten",
+        )
+        if measure_timing and feature_start is not None:
+            feature_time_seconds += float(time.perf_counter() - feature_start)
 
-            y_train = metadata.loc[train_idx, "target"].to_numpy()
-            y_test = metadata.loc[test_idx, "target"].to_numpy()
+        if metadata is None:
+            metadata = _ensure_metadata_columns(layer_metadata)
+            metadata["target"] = (metadata["mean"] > 0).astype(int)
+            nonzero_mask = metadata["mean"].to_numpy() != 0
+            vertical_mask = (
+                metadata["mean"].to_numpy() == 0
+                if evaluate_vertical
+                else np.zeros(len(metadata), dtype=bool)
+            )
+            metadata_nonzero = metadata.loc[nonzero_mask].reset_index(drop=True)
+            metadata_vertical = metadata.loc[vertical_mask].reset_index(drop=True)
+            if metadata_nonzero.empty:
+                raise ValueError("No nonzero-mean samples are available after filtering.")
 
-            if train_idx.sum() == 0 or test_idx.sum() == 0:
-                continue
-            if len(np.unique(y_train)) < 2:
-                continue
+            y_nonzero = metadata_nonzero["target"].to_numpy()
+            folds = build_stratified_kfold_splits(
+                labels=y_nonzero,
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=random_state,
+            )
+        else:
+            layer_metadata = _ensure_metadata_columns(layer_metadata)
+            if not layer_metadata["file_name"].reset_index(drop=True).equals(
+                metadata["file_name"].reset_index(drop=True)
+            ):
+                raise ValueError("Feature extraction order changed across layers.")
 
-            svm_result = fit_linear_svm(
-                X_train=X[train_idx],
-                y_train=y_train,
-                X_test=X[test_idx],
-                y_test=y_test,
-                C=svm_c,
+        X = layer_features[layer_name]
+        X_nonzero = X[nonzero_mask]
+        X_vertical = X[vertical_mask]
+        _warn_if_large_dense_matrix(X_nonzero, decoder_name=decoder_name)
+
+        for fold in folds:
+            fold_start = time.perf_counter() if measure_timing else None
+
+            fold_result = fit_linear_decoder(
+                X_train=X_nonzero[fold.train_idx],
+                y_train=y_nonzero[fold.train_idx],
+                X_test=X_nonzero[fold.test_idx],
+                y_test=y_nonzero[fold.test_idx],
+                decoder_name=decoder_name,
+                svm_c=svm_c,
+                sgd_alpha=sgd_alpha,
+                max_iter=max_iter,
+                tol=tol,
                 random_state=random_state,
             )
 
-            nonzero_trials = metadata.loc[test_idx].copy()
-            nonzero_trials["pred_class"] = svm_result["y_pred"].astype(int)
-            nonzero_trials["margin"] = svm_result["margins"].astype(float)
-            nonzero_trials["choice_cw"] = (nonzero_trials["pred_class"] == 1).astype(int)
-            nonzero_trials["subset"] = "test_nonzero"
-            nonzero_trials["model_name"] = model_name
-            nonzero_trials["layer_name"] = layer_name
-            nonzero_trials["split_id"] = split.split_id
+            test_trials = metadata_nonzero.iloc[fold.test_idx].copy()
+            test_trials["fold_id"] = fold.fold_id
+            test_trials["layer_name"] = layer_name
+            test_trials["pred_class"] = fold_result["y_pred"].astype(int)
+            test_trials["decision_value"] = fold_result["decision_value"].astype(float)
+            test_trials["correct"] = (
+                test_trials["pred_class"].to_numpy() == test_trials["target"].to_numpy()
+            ).astype(int)
+            test_trials["decoder_name"] = decoder_name
+            trial_rows.append(test_trials[TRIAL_COLUMNS])
 
-            boundary_trials, boundary_summary = evaluate_boundary_m0(
-                estimator=svm_result["estimator"],
-                scaler=svm_result["scaler"],
-                X_boundary=X[boundary_idx],
-                metadata_boundary=metadata.loc[boundary_idx],
-            )
-            boundary_trials["subset"] = "test_boundary_m0"
-            boundary_trials["model_name"] = model_name
-            boundary_trials["layer_name"] = layer_name
-            boundary_trials["split_id"] = split.split_id
-
-            all_trials.extend([nonzero_trials, boundary_trials])
-
-            metric_rows.append(
+            fold_metric_rows.append(
                 {
-                    "model_name": model_name,
                     "layer_name": layer_name,
-                    "split_id": split.split_id,
-                    "held_out_axis": split.held_out_axis,
-                    "held_out_value": split.held_out_value,
-                    "train_n": int(train_idx.sum()),
-                    "test_nonzero_n": int(test_idx.sum()),
-                    "balanced_accuracy": svm_result["metrics"]["balanced_accuracy"],
-                    "f1": svm_result["metrics"]["f1"],
-                    "auroc": svm_result["metrics"]["auroc"],
-                    "confusion_matrix": str(svm_result["metrics"]["confusion_matrix"]),
-                    "boundary_n": boundary_summary["boundary_n"],
-                    "boundary_cw_rate": boundary_summary["boundary_cw_rate"],
-                    "boundary_margin_mean": boundary_summary["boundary_margin_mean"],
-                    "boundary_margin_std": boundary_summary["boundary_margin_std"],
+                    "fold_id": fold.fold_id,
+                    "train_n": int(len(fold.train_idx)),
+                    "test_n": int(len(fold.test_idx)),
+                    "accuracy": fold_result["metrics"]["accuracy"],
+                    "balanced_accuracy": fold_result["metrics"]["balanced_accuracy"],
+                    "f1": fold_result["metrics"]["f1"],
+                    "auroc": fold_result["metrics"]["auroc"],
+                    "decoder_name": decoder_name,
                 }
             )
 
-            if save_artifacts:
-                artifact_dir = os.path.join(output_dir, model_name, layer_name, split.split_id)
-                split_manifest = _build_split_manifest(metadata, split)
-                effective_config = dict(run_config or {})
-                if not effective_config:
-                    effective_config = {}
-                effective_config.update(
+            if evaluate_vertical and len(metadata_vertical) > 0:
+                boundary_trials, boundary_summary = evaluate_vertical_boundary(
+                    estimator=fold_result["estimator"],
+                    scaler=fold_result["scaler"],
+                    X_vertical=X_vertical,
+                    metadata_vertical=metadata_vertical,
+                )
+                boundary_trials["fold_id"] = fold.fold_id
+                boundary_trials["layer_name"] = layer_name
+                boundary_trials["decoder_name"] = decoder_name
+                boundary_rows.append(boundary_trials[BOUNDARY_TRIAL_COLUMNS])
+                boundary_summary_rows.append(
                     {
-                        "model_name": model_name,
                         "layer_name": layer_name,
-                        "split_id": split.split_id,
-                        "held_out_axis": split.held_out_axis,
-                        "held_out_value": split.held_out_value,
-                        "split_mode": split_mode,
-                        "holdout_values": list(holdout_values) if holdout_values is not None else None,
-                        "pretrained": pretrained,
-                        "device": device,
-                        "batch_size": batch_size,
-                        "num_workers": num_workers,
-                        "svm_c": svm_c,
-                        "random_state": random_state,
-                        "train_filter": _condition_filter_to_dict(train_filter),
-                        "test_filter": _condition_filter_to_dict(test_filter),
+                        "fold_id": fold.fold_id,
+                        "boundary_n": boundary_summary["boundary_n"],
+                        "cw_rate": boundary_summary["cw_rate"],
+                        "decision_value_mean": boundary_summary["decision_value_mean"],
+                        "decision_value_std": boundary_summary["decision_value_std"],
+                        "decoder_name": decoder_name,
                     }
                 )
-                save_decoder_artifacts(
-                    artifact_dir=artifact_dir,
-                    estimator=svm_result["estimator"],
-                    scaler=svm_result["scaler"],
-                    split_manifest=split_manifest,
-                    run_config=effective_config,
-                    metadata={
-                        "model_name": model_name,
+
+            if measure_timing and fold_start is not None:
+                timing_rows.append(
+                    {
+                        "stage": "fold_decode",
                         "layer_name": layer_name,
-                        "split_id": split.split_id,
-                        "metrics": metric_rows[-1],
-                    },
+                        "fold_id": fold.fold_id,
+                        "seconds": float(time.perf_counter() - fold_start),
+                    }
                 )
 
-    if not metric_rows:
-        raise ValueError("No valid layer/split runs were produced. Check filters and split settings.")
+        if measure_timing and layer_start is not None:
+            timing_rows.append(
+                {
+                    "stage": "layer_decode",
+                    "layer_name": layer_name,
+                    "fold_id": None,
+                    "seconds": float(time.perf_counter() - layer_start),
+                }
+            )
 
-    trial_df = pd.concat(all_trials, ignore_index=True)
-    metrics_df = pd.DataFrame(metric_rows)
-    condition_df = _aggregate_condition_summary(trial_df)
-
-    layer_label = selected_layer if selected_layer != "all" else "all_layers"
-    prefix = f"{model_name}_{layer_label}_{split_mode}"
-    save_trial_outputs(trial_df, os.path.join(output_dir, f"{prefix}_trial_outputs.csv"))
-    save_condition_summaries(
-        condition_df, os.path.join(output_dir, f"{prefix}_condition_summary.csv")
-    )
-    save_condition_summaries(
-        metrics_df, os.path.join(output_dir, f"{prefix}_layer_metrics.csv")
-    )
-    return trial_df, condition_df, metrics_df
-
-
-def run_default_v1_panel(
-    img_dir: str,
-    output_dir: str,
-    models: Optional[Iterable[str]] = None,
-    input_size: int = 224,
-    split_mode: str = "leave_one_sd_out",
-    holdout_values: Optional[Iterable[int]] = None,
-    pretrained: bool = True,
-    device: str = "cpu",
-    batch_size: int = 64,
-    num_workers: int = 0,
-    svm_c: float = 1.0,
-    random_state: int = 0,
-    include_single: bool = False,
-    include_zerovar: bool = False,
-    selected_layer: str = "all",
-    train_filter: Optional[ConditionFilter] = None,
-    test_filter: Optional[ConditionFilter] = None,
-    save_artifacts: bool = True,
-) -> Dict[str, pd.DataFrame]:
-    """Run v1 defaults over a selected model panel."""
-    transform = make_deterministic_transform(input_size=input_size)
-    dataset = EPGabors(
-        img_dir=img_dir,
-        include_vertical=True,
-        include_single=include_single,
-        include_zerovar=include_zerovar,
-        transform=transform,
-        return_filename=True,
-        return_condition_id=True,
-    )
-
-    model_list = list(models) if models is not None else list(DEFAULT_MODEL_NAMES)
-    metrics_outputs = {}
-    for model_name in model_list:
-        _, _, metrics_df = run_layerwise_binary_decoding(
-            dataset=dataset,
-            model_name=model_name,
-            output_dir=output_dir,
-            split_mode=split_mode,
-            holdout_values=holdout_values,
-            pretrained=pretrained,
-            device=device,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            svm_c=svm_c,
-            random_state=random_state,
-            selected_layer=selected_layer,
-            train_filter=train_filter,
-            test_filter=test_filter,
-            save_artifacts=save_artifacts,
-            run_config={
-                "mode": "panel",
-                "selected_layer": selected_layer,
-                "split_mode": split_mode,
-                "holdout_values": list(holdout_values) if holdout_values is not None else None,
-                "input_size": input_size,
-                "pretrained": pretrained,
-                "device": device,
-                "batch_size": batch_size,
-                "num_workers": num_workers,
-                "svm_c": svm_c,
-                "random_state": random_state,
-                "include_single": include_single,
-                "include_zerovar": include_zerovar,
-                "train_filter": _condition_filter_to_dict(train_filter),
-                "test_filter": _condition_filter_to_dict(test_filter),
+    if measure_timing:
+        timing_rows.insert(
+            0,
+            {
+                "stage": "feature_extraction",
+                "layer_name": None,
+                "fold_id": None,
+                "seconds": feature_time_seconds,
             },
         )
-        metrics_outputs[model_name] = metrics_df
-    return metrics_outputs
+
+    trial_df = (
+        pd.concat(trial_rows, ignore_index=True)
+        if trial_rows
+        else pd.DataFrame(columns=TRIAL_COLUMNS)
+    )
+    fold_metrics_df = pd.DataFrame(fold_metric_rows, columns=FOLD_METRIC_COLUMNS)
+    layer_summary_df = _aggregate_layer_summary(fold_metrics_df)
+    boundary_vertical_df = (
+        pd.concat(boundary_rows, ignore_index=True)
+        if boundary_rows
+        else pd.DataFrame(columns=BOUNDARY_TRIAL_COLUMNS)
+    )
+    boundary_summary_df = pd.DataFrame(boundary_summary_rows, columns=BOUNDARY_SUMMARY_COLUMNS)
+
+    if measure_timing and total_start is not None:
+        timing_rows.append(
+            {
+                "stage": "total",
+                "layer_name": None,
+                "fold_id": None,
+                "seconds": float(time.perf_counter() - total_start),
+            }
+        )
+    timing_df = pd.DataFrame(timing_rows, columns=TIMING_COLUMNS)
+
+    layer_label = selected_layer if selected_layer != "all" else "all_layers"
+    prefix = f"resnet50_{layer_label}_kfold"
+    _save_dataframe(trial_df, os.path.join(output_dir, f"{prefix}_trial_outputs.csv"))
+    _save_dataframe(fold_metrics_df, os.path.join(output_dir, f"{prefix}_fold_metrics.csv"))
+    _save_dataframe(layer_summary_df, os.path.join(output_dir, f"{prefix}_layer_summary.csv"))
+    if evaluate_vertical and not boundary_vertical_df.empty:
+        _save_dataframe(
+            boundary_vertical_df,
+            os.path.join(output_dir, f"{prefix}_vertical_boundary_outputs.csv"),
+        )
+        _save_dataframe(
+            boundary_summary_df,
+            os.path.join(output_dir, f"{prefix}_vertical_boundary_summary.csv"),
+        )
+    if measure_timing:
+        _save_dataframe(timing_df, os.path.join(output_dir, f"{prefix}_timing.csv"))
+
+    return (
+        trial_df,
+        fold_metrics_df,
+        layer_summary_df,
+        boundary_vertical_df,
+        boundary_summary_df,
+        timing_df,
+    )
 
 
 def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
@@ -752,60 +739,55 @@ def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
 
-def _condition_filter_from_args(args: argparse.Namespace, prefix: str) -> Optional[ConditionFilter]:
-    data = ConditionFilter(
-        means=_parse_int_list(getattr(args, f"{prefix}_means", None)),
-        sds=_parse_int_list(getattr(args, f"{prefix}_sds", None)),
-        sss=_parse_int_list(getattr(args, f"{prefix}_sss", None)),
-        instances=_parse_int_list(getattr(args, f"{prefix}_instances", None)),
-        exclude_means=_parse_int_list(getattr(args, f"exclude_{prefix}_means", None)),
-        exclude_sds=_parse_int_list(getattr(args, f"exclude_{prefix}_sds", None)),
-        exclude_sss=_parse_int_list(getattr(args, f"exclude_{prefix}_sss", None)),
-        exclude_instances=_parse_int_list(getattr(args, f"exclude_{prefix}_instances", None)),
-    )
-    if all(value is None for value in asdict(data).values()):
-        return None
-    return data
-
-
-def _print_layer_listing(model_name: str) -> None:
-    layer_df = list_available_layers(model_name)
+def _print_layer_listing() -> None:
+    layer_df = list_available_layers("resnet50")
     print(layer_df.to_string(index=False))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run EPGabor CNN layerwise decoding v1.1.")
+    parser = argparse.ArgumentParser(
+        description="Run sparse-endpoint ResNet50 K-fold decoding on EP Gabor images."
+    )
     parser.add_argument("--img-dir", type=str, default="images")
-    parser.add_argument("--output-dir", type=str, default="results_v1")
-    parser.add_argument("--model-name", type=str, default="resnet50")
+    parser.add_argument("--output-dir", type=str, default="results_kfold")
     parser.add_argument("--layer-name", type=str, default="all")
     parser.add_argument("--list-layers", action="store_true", default=False)
-    parser.add_argument(
-        "--split-mode",
-        type=str,
-        default="leave_one_sd_out",
-        choices=["leave_one_sd_out", "leave_one_ss_out", "explicit"],
-    )
-    parser.add_argument("--holdout-values", type=str, default=None)
+    parser.add_argument("--decoder-name", type=str, default="linear_svc", choices=["linear_svc", "sgd_hinge"])
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--random-state", type=int, default=0)
     parser.add_argument("--input-size", type=int, default=224)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--svm-c", type=float, default=1.0)
-    parser.add_argument("--random-state", type=int, default=0)
+    parser.add_argument("--sgd-alpha", type=float, default=0.0001)
+    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--tol", type=float, default=1e-3)
     parser.add_argument(
         "--pretrained",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use pretrained weights (default: True). Use --no-pretrained to disable.",
+        help="Use pretrained ResNet50 weights (default: True).",
+    )
+    parser.add_argument(
+        "--evaluate-vertical",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate mean=0 images after each fold (default: True).",
+    )
+    parser.add_argument(
+        "--measure-timing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Measure feature extraction, fold, layer, and total runtime (default: True).",
     )
     parser.add_argument("--include-single", action="store_true", default=False)
     parser.add_argument("--include-zerovar", action="store_true", default=False)
     parser.add_argument(
-        "--save-artifacts",
+        "--include-vertical",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Save decoder bundle, split manifest, and run config (default: True).",
+        default=None,
+        help="Override whether mean=0 images are included in the dataset. By default this follows --evaluate-vertical.",
     )
 
     parser.add_argument("--dataset-means", type=str, default=None)
@@ -813,33 +795,16 @@ def main() -> None:
     parser.add_argument("--dataset-sss", type=str, default=None)
     parser.add_argument("--dataset-instances", type=str, default=None)
 
-    parser.add_argument("--train-means", type=str, default=None)
-    parser.add_argument("--train-sds", type=str, default=None)
-    parser.add_argument("--train-sss", type=str, default=None)
-    parser.add_argument("--train-instances", type=str, default=None)
-    parser.add_argument("--exclude-train-means", type=str, default=None)
-    parser.add_argument("--exclude-train-sds", type=str, default=None)
-    parser.add_argument("--exclude-train-sss", type=str, default=None)
-    parser.add_argument("--exclude-train-instances", type=str, default=None)
-
-    parser.add_argument("--test-means", type=str, default=None)
-    parser.add_argument("--test-sds", type=str, default=None)
-    parser.add_argument("--test-sss", type=str, default=None)
-    parser.add_argument("--test-instances", type=str, default=None)
-    parser.add_argument("--exclude-test-means", type=str, default=None)
-    parser.add_argument("--exclude-test-sds", type=str, default=None)
-    parser.add_argument("--exclude-test-sss", type=str, default=None)
-    parser.add_argument("--exclude-test-instances", type=str, default=None)
-
     args = parser.parse_args()
 
     if args.list_layers:
-        _print_layer_listing(args.model_name)
+        _print_layer_listing()
         return
 
+    include_vertical = args.evaluate_vertical if args.include_vertical is None else args.include_vertical
     dataset = EPGabors(
         img_dir=args.img_dir,
-        include_vertical=True,
+        include_vertical=include_vertical,
         include_single=args.include_single,
         include_zerovar=args.include_zerovar,
         filter_mean=_parse_int_list(args.dataset_means),
@@ -851,52 +816,23 @@ def main() -> None:
         return_condition_id=True,
     )
 
-    holdout_values = _parse_int_list(args.holdout_values)
-    train_filter = _condition_filter_from_args(args, "train")
-    test_filter = _condition_filter_from_args(args, "test")
-
-    run_config = {
-        "model_name": args.model_name,
-        "layer_name": args.layer_name,
-        "split_mode": args.split_mode,
-        "holdout_values": holdout_values,
-        "input_size": args.input_size,
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "device": args.device,
-        "svm_c": args.svm_c,
-        "random_state": args.random_state,
-        "pretrained": args.pretrained,
-        "include_single": args.include_single,
-        "include_zerovar": args.include_zerovar,
-        "save_artifacts": args.save_artifacts,
-        "dataset_filters": {
-            "means": _parse_int_list(args.dataset_means),
-            "sds": _parse_int_list(args.dataset_sds),
-            "sss": _parse_int_list(args.dataset_sss),
-            "instances": _parse_int_list(args.dataset_instances),
-        },
-        "train_filter": _condition_filter_to_dict(train_filter),
-        "test_filter": _condition_filter_to_dict(test_filter),
-    }
-
-    run_layerwise_binary_decoding(
+    run_resnet50_kfold_decoding(
         dataset=dataset,
-        model_name=args.model_name,
         output_dir=args.output_dir,
-        split_mode=args.split_mode,
-        holdout_values=holdout_values,
+        selected_layer=args.layer_name,
+        decoder_name=args.decoder_name,
+        n_splits=args.n_splits,
         pretrained=args.pretrained,
         device=args.device,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        svm_c=args.svm_c,
         random_state=args.random_state,
-        selected_layer=args.layer_name,
-        train_filter=train_filter,
-        test_filter=test_filter,
-        save_artifacts=args.save_artifacts,
-        run_config=run_config,
+        svm_c=args.svm_c,
+        sgd_alpha=args.sgd_alpha,
+        max_iter=args.max_iter,
+        tol=args.tol,
+        evaluate_vertical=args.evaluate_vertical,
+        measure_timing=args.measure_timing,
     )
 
 

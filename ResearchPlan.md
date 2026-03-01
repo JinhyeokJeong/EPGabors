@@ -1,60 +1,64 @@
-# Research Plan (v1): Layerwise Mean-Orientation Decoding in Pretrained CNNs
+# Research Plan: Sparse-Endpoint ResNet50 K-Fold Decoding
 
 ## Objective
-Build a reproducible pipeline to test whether pretrained CNN representations linearly encode binary mean orientation (CCW vs CW) in EPOriGabors, with cross-condition generalization across orientation variance (`sd`) and set size (`ss`).
 
-## Scope (v1)
-- Readout: binary mean orientation (`mean < 0` vs `mean > 0`)
-- `mean = 0`: excluded from training, evaluated as boundary cases
-- Models: `resnet50`, `convnext_tiny`, `efficientnet_b0`, `vgg16_bn` (timm)
-- Layers: stage-end readouts only
-- Decoder: `LinearSVC` (scikit-learn), train-only feature scaling
-- Preprocessing: deterministic `resize + tensor + ImageNet normalization`, no crop/rotation/augmentation
-- Outputs: both trial-level and condition-level CSVs
+Build a simple, research-oriented decoding pipeline to test whether sparse ResNet50 representations linearly encode binary mean orientation (`mean < 0` vs `mean > 0`) in the EP Gabor stimulus set.
 
-## Dataset and Defaults
-- Dataset class: `EPGabors` in `EPOriGabors.py`
-- Default v1 filtering:
-  - `include_single=False` (exclude `ss=1`)
-  - `include_zerovar=False` (exclude `sd=0`)
-  - `include_vertical=True` (`mean=0` retained for boundary evaluation)
+## Scope
 
-## Pipeline
-1. Load filtered EPGabors with metadata (`mean`, `sd`, `ss`, `instance`, filename).
-2. Extract stage-end activations from each model.
-3. Apply global average pooling to obtain per-image feature vectors.
-4. Build cross-condition splits:
-   - `leave_one_sd_out` or `leave_one_ss_out`
-   - training excludes `mean=0`
-5. Fit `LinearSVC` per model/layer/split.
-6. Evaluate:
-   - Nonzero means: balanced accuracy, F1, AUROC, confusion matrix
-   - `mean=0`: CW choice rate and margin distribution
-7. Save:
-   - Trial outputs (`*_trial_outputs.csv`)
-   - Condition summaries (`*_condition_summary.csv`)
-   - Layer metrics (`*_layer_metrics.csv`)
+- Model: `resnet50`
+- Endpoints:
+  - `stem`
+  - `layer1_last`
+  - `layer2_last`
+  - `layer3_last`
+  - `layer4_last`
+- Features: flatten raw endpoint activations (no extra spatial pooling)
+- Decoder:
+  - default: `LinearSVC`
+  - fallback: `SGDClassifier(loss="hinge")`
+- Evaluation:
+  - `StratifiedKFold`
+  - default `n_splits=5`
+  - stratify only on the binary class label
+- Optional boundary analysis:
+  - keep `mean=0` images out of training
+  - score them after each fold model is fit
+- Outputs:
+  - trial-level test predictions with metadata
+  - fold-level metrics
+  - layer-level aggregated summaries
+  - optional vertical-image boundary outputs
+  - timing summaries
+
+## Default dataset subset
+
+- `include_single=False` (exclude `ss=1`)
+- `include_zerovar=False` (exclude `sd=0`)
+- `mean=0` excluded from training/test folds
+- `mean=0` can still be retained in the dataset for optional boundary evaluation
 
 ## Implemented API
-- `get_model_and_layer_map(model_name, pretrained=True, source="timm", device="cpu")`
-- `extract_layer_features(model, layer_map, dataloader, device="cpu", pooling="gap")`
-- `build_cross_condition_splits(metadata, split_mode="leave_one_sd_out", holdout_values=None)`
-- `fit_linear_svm(X_train, y_train, X_test, y_test, C=1.0, random_state=0, max_iter=10000)`
-- `evaluate_boundary_m0(estimator, scaler, X_boundary, metadata_boundary)`
-- `save_trial_outputs(trial_df, output_path)`
-- `save_condition_summaries(condition_df, output_path)`
-- End-to-end runner:
-  - `run_layerwise_binary_decoding(...)`
-  - `run_default_v1_panel(...)`
 
-## Validation Checklist
-- Dataset parsing and level counts match expected design (14,000 images).
-- `include_zerovar=False` excludes `sd=0`.
-- Split masks are non-overlapping.
-- No `mean=0` images used in training labels.
-- Extracted feature matrices are shape-consistent per layer.
+- `get_resnet50_sparse_layer_map(pretrained=True, device="cpu")`
+- `extract_layer_features(model, layer_map, dataloader, device="cpu", feature_mode="flatten")`
+- `build_stratified_kfold_splits(labels, n_splits=5, shuffle=True, random_state=0)`
+- `fit_linear_decoder(...)`
+- `evaluate_vertical_boundary(estimator, scaler, X_vertical, metadata_vertical)`
+- `run_resnet50_kfold_decoding(...)`
 
-## Next Phase (v2)
-- Add psychometric fitting (PSE/JND-like analyses) using trial-level outputs.
-- Add all-convolution probing mode.
-- Extend to continuous decoding and orientation-variance decoding.
+## Validation checklist
+
+- Dataset parsing still matches the expected 14,000-image design.
+- Sparse endpoint mapping resolves the five expected ResNet50 modules.
+- Extracted feature matrices are 2D after flattening and have one row per image.
+- K-fold train/test indices are non-overlapping.
+- `mean=0` samples are excluded from training folds.
+- Vertical-image outputs, when enabled, remain separate from the main CV trial outputs.
+- Timing rows include feature extraction, fold decoding, layer decoding, and total runtime.
+
+## Next likely extensions
+
+- Add regression or multiclass readouts for mean orientation.
+- Add condition-wise summary helpers for plots by `sd` and `ss`.
+- Extend the same pipeline pattern to other network architectures once the ResNet50 baseline is stable.
