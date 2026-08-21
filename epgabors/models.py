@@ -40,8 +40,13 @@ def list_available_layers(model_name: str = "resnet50") -> pd.DataFrame:
 def get_resnet50_sparse_layer_map(
     pretrained: bool = True,
     device: str = "cpu",
+    model_seed: int | None = None,
 ) -> Tuple[torch.nn.Module, Dict[str, torch.nn.Module]]:
     """Return a ResNet50 model and sparse endpoint module map."""
+    if model_seed is not None:
+        torch.manual_seed(int(model_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(model_seed))
     model = timm.create_model("resnet50", pretrained=pretrained)
     model.eval().to(device)
 
@@ -56,13 +61,14 @@ def get_model_and_layer_map(
     pretrained: bool = True,
     source: str = "timm",
     device: str = "cpu",
+    model_seed: int | None = None,
 ) -> Tuple[torch.nn.Module, Dict[str, torch.nn.Module]]:
     """Backward-compatible model/layer factory."""
     if source != "timm":
         raise ValueError("Only 'timm' is supported.")
     if model_name != "resnet50":
         raise ValueError("Only 'resnet50' is supported in this pipeline.")
-    return get_resnet50_sparse_layer_map(pretrained=pretrained, device=device)
+    return get_resnet50_sparse_layer_map(pretrained=pretrained, device=device, model_seed=model_seed)
 
 
 def select_layer_map(

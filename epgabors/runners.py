@@ -329,6 +329,7 @@ def run_resnet50_kfold_decoding(
     decoder_name: str = "linear_svc",
     n_splits: int = 5,
     pretrained: bool = True,
+    model_seed: Optional[int] = None,
     device: str = "cpu",
     batch_size: int = 32,
     num_workers: int = 0,
@@ -344,7 +345,11 @@ def run_resnet50_kfold_decoding(
     total_start = time.perf_counter() if measure_timing else None
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    model, full_layer_map = get_resnet50_sparse_layer_map(pretrained=pretrained, device=device)
+    model, full_layer_map = get_resnet50_sparse_layer_map(
+        pretrained=pretrained,
+        device=device,
+        model_seed=model_seed,
+    )
     selected_layer_map = select_layer_map(full_layer_map, selected_layer=selected_layer)
 
     timing_rows: List[Dict[str, object]] = []
@@ -550,6 +555,7 @@ def run_resnet50_kfold_decoding(
             "decoder_name": decoder_name,
             "n_splits": int(n_splits),
             "pretrained": bool(pretrained),
+            "model_seed": None if model_seed is None else int(model_seed),
             "device": device,
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),
@@ -582,6 +588,7 @@ def run_resnet50_kfold_regression(
     regressor_name: str = "ridge",
     n_splits: int = 5,
     pretrained: bool = True,
+    model_seed: Optional[int] = None,
     device: str = "cpu",
     batch_size: int = 32,
     num_workers: int = 0,
@@ -597,7 +604,11 @@ def run_resnet50_kfold_regression(
     total_start = time.perf_counter() if measure_timing else None
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    model, full_layer_map = get_resnet50_sparse_layer_map(pretrained=pretrained, device=device)
+    model, full_layer_map = get_resnet50_sparse_layer_map(
+        pretrained=pretrained,
+        device=device,
+        model_seed=model_seed,
+    )
     selected_layer_map = select_layer_map(full_layer_map, selected_layer=selected_layer)
 
     timing_rows: List[Dict[str, object]] = []
@@ -756,6 +767,7 @@ def run_resnet50_kfold_regression(
             "regressor_name": regressor_name,
             "n_splits": int(n_splits),
             "pretrained": bool(pretrained),
+            "model_seed": None if model_seed is None else int(model_seed),
             "device": device,
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),
@@ -785,6 +797,12 @@ def classification_main() -> None:
     parser.add_argument("--decoder-name", type=str, default="linear_svc", choices=["linear_svc", "sgd_hinge"])
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--random-state", type=int, default=0)
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        default=None,
+        help="Optional seed applied before model creation. Useful for reproducible --no-pretrained controls.",
+    )
     parser.add_argument("--input-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -851,6 +869,7 @@ def classification_main() -> None:
         decoder_name=args.decoder_name,
         n_splits=args.n_splits,
         pretrained=args.pretrained,
+        model_seed=args.model_seed,
         device=args.device,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -880,6 +899,12 @@ def regression_main() -> None:
     )
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--random-state", type=int, default=0)
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        default=None,
+        help="Optional seed applied before model creation. Useful for reproducible --no-pretrained controls.",
+    )
     parser.add_argument("--input-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -940,6 +965,7 @@ def regression_main() -> None:
         regressor_name=args.regressor_name,
         n_splits=args.n_splits,
         pretrained=args.pretrained,
+        model_seed=args.model_seed,
         device=args.device,
         batch_size=args.batch_size,
         num_workers=args.num_workers,

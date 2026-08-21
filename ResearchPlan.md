@@ -20,6 +20,7 @@ Revive the EP Gabor project as a small, maintainable package for testing whether
 - Classification excludes `mean=0` from training and nonzero CV scoring.
 - Classification writes separate `mean=0` vertical-boundary predictions and a combined prediction table.
 - Regression includes `mean=0` by default.
+- Random-weight controls should use `--no-pretrained --model-seed <seed>` while keeping `--random-state` fixed unless split variability is the target.
 
 ## Implemented API
 

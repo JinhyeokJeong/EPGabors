@@ -56,6 +56,8 @@ This predicts the sign of mean orientation:
 
 `mean=0` images are never used for classifier training or nonzero CV metrics. When present, they are evaluated separately after each fold model and are also written to a combined prediction table.
 
+For random-weight controls, add `--no-pretrained --model-seed <seed>`. Keep `--random-state` fixed when you want runs to vary only the random backbone weights.
+
 Example:
 
 ```bash
@@ -66,6 +68,7 @@ Example:
   --decoder-name linear_svc \
   --n-splits 5 \
   --device cpu \
+  --model-seed 0 \
   --include-zerovar \
   --evaluate-vertical
 ```
@@ -97,6 +100,7 @@ Example:
   --n-splits 5 \
   --target-scaling none \
   --device cpu \
+  --model-seed 0 \
   --include-zerovar \
   --include-vertical
 ```

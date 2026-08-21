@@ -5,6 +5,7 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import DataLoader
 
 from EPOriGabors import EPGabors, summarize_conditions, validate_condition_grid
@@ -93,6 +94,15 @@ def test_list_available_layers_returns_sparse_resnet50_map():
         "layer3.5",
         "layer4.2",
     ]
+
+
+def test_random_resnet50_model_seed_is_reproducible():
+    model_a, _ = get_resnet50_sparse_layer_map(pretrained=False, device="cpu", model_seed=123)
+    model_b, _ = get_resnet50_sparse_layer_map(pretrained=False, device="cpu", model_seed=123)
+    model_c, _ = get_resnet50_sparse_layer_map(pretrained=False, device="cpu", model_seed=124)
+
+    assert torch.equal(model_a.conv1.weight, model_b.conv1.weight)
+    assert not torch.equal(model_a.conv1.weight, model_c.conv1.weight)
 
 
 def test_feature_extraction_flattens_sparse_endpoints():
