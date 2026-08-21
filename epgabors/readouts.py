@@ -122,14 +122,23 @@ def fit_linear_decoder(
 
     estimator.fit(X_train_scaled, y_train)
     y_pred = estimator.predict(X_test_scaled)
-    decision_value = np.asarray(estimator.decision_function(X_test_scaled)).reshape(-1)
+    decision_value = np.asarray(estimator.decision_function(X_test_scaled))
 
+    unique_test = np.unique(y_test)
     metrics = {
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-        "f1": float(f1_score(y_test, y_pred)),
-        "auroc": float(roc_auc_score(y_test, decision_value)) if len(np.unique(y_test)) == 2 else np.nan,
+        "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
     }
+    if len(unique_test) == 2:
+        decision_value_binary = decision_value.reshape(-1)
+        metrics["f1"] = float(f1_score(y_test, y_pred, zero_division=0))
+        metrics["auroc"] = float(roc_auc_score(y_test, decision_value_binary))
+        decision_value = decision_value_binary
+    else:
+        metrics["f1"] = np.nan
+        metrics["auroc"] = np.nan
 
     return {
         "estimator": estimator,

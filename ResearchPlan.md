@@ -19,6 +19,7 @@ Revive the EP Gabor project as a small, maintainable package for testing whether
 - `ss=1` is excluded by default in the runner script.
 - Classification excludes `mean=0` from training and nonzero CV scoring.
 - Classification writes separate `mean=0` vertical-boundary predictions and a combined prediction table.
+- Seven-class classification is available with `--classification-mode mean7`; in that mode `mean=0` is an ordinary class and confusion matrices are saved.
 - Regression includes `mean=0` by default.
 - Random-weight controls should use `--no-pretrained --model-seed <seed>` while keeping `--random-state` fixed unless split variability is the target.
 

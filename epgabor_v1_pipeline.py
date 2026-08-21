@@ -22,8 +22,12 @@ from epgabors.runners import (
     CLASSIFICATION_FOLD_METRIC_COLUMNS as FOLD_METRIC_COLUMNS,
     CLASSIFICATION_LAYER_SUMMARY_COLUMNS as LAYER_SUMMARY_COLUMNS,
     CLASSIFICATION_TRIAL_COLUMNS as TRIAL_COLUMNS,
+    MEAN7_FOLD_METRIC_COLUMNS,
+    MEAN7_LAYER_SUMMARY_COLUMNS,
+    MEAN7_TRIAL_COLUMNS,
     TIMING_COLUMNS,
     classification_main as main,
+    run_resnet50_kfold_mean7_decoding,
     run_resnet50_kfold_decoding,
 )
 
@@ -34,6 +38,9 @@ __all__ = [
     "FOLD_METRIC_COLUMNS",
     "FoldSpec",
     "LAYER_SUMMARY_COLUMNS",
+    "MEAN7_FOLD_METRIC_COLUMNS",
+    "MEAN7_LAYER_SUMMARY_COLUMNS",
+    "MEAN7_TRIAL_COLUMNS",
     "SPARSE_LAYER_PATHS",
     "TIMING_COLUMNS",
     "TRIAL_COLUMNS",
@@ -47,6 +54,7 @@ __all__ = [
     "list_available_layers",
     "main",
     "make_deterministic_transform",
+    "run_resnet50_kfold_mean7_decoding",
     "run_resnet50_kfold_decoding",
     "select_layer_map",
 ]

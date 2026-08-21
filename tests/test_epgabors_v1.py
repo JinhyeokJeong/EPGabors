@@ -13,6 +13,8 @@ from epgabor_v1_pipeline import (
     BOUNDARY_SUMMARY_COLUMNS,
     BOUNDARY_TRIAL_COLUMNS,
     CLASSIFICATION_COMBINED_COLUMNS,
+    MEAN7_FOLD_METRIC_COLUMNS,
+    MEAN7_TRIAL_COLUMNS,
     TIMING_COLUMNS,
     build_stratified_kfold_splits,
     evaluate_vertical_boundary,
@@ -21,6 +23,7 @@ from epgabor_v1_pipeline import (
     get_resnet50_sparse_layer_map,
     list_available_layers,
     make_deterministic_transform,
+    run_resnet50_kfold_mean7_decoding,
     run_resnet50_kfold_decoding,
 )
 
@@ -184,6 +187,37 @@ def test_linear_decoder_supports_both_modes():
         assert result["decision_value"].shape[0] == len(y_test)
 
 
+def test_linear_decoder_supports_multiclass_mean_labels():
+    rng = np.random.default_rng(0)
+    labels = np.array([-12, -8, -4, 0, 4, 8, 12])
+    centers = rng.normal(size=(len(labels), 8)) * 4.0
+    X_train = np.vstack(
+        [centers[idx] + rng.normal(scale=0.25, size=(12, 8)) for idx in range(len(labels))]
+    )
+    y_train = np.repeat(labels, 12)
+    X_test = np.vstack(
+        [centers[idx] + rng.normal(scale=0.25, size=(5, 8)) for idx in range(len(labels))]
+    )
+    y_test = np.repeat(labels, 5)
+
+    result = fit_linear_decoder(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        decoder_name="sgd_hinge",
+        random_state=0,
+        max_iter=5000,
+    )
+
+    assert result["metrics"]["accuracy"] > 0.9
+    assert result["metrics"]["macro_f1"] > 0.9
+    assert result["metrics"]["weighted_f1"] > 0.9
+    assert np.isnan(result["metrics"]["f1"])
+    assert np.isnan(result["metrics"]["auroc"])
+    assert result["decision_value"].shape == (len(y_test), len(labels))
+
+
 def test_evaluate_vertical_boundary_returns_metadata():
     rng = np.random.default_rng(1)
     X_train = np.concatenate(
@@ -325,6 +359,75 @@ def test_run_resnet50_kfold_decoding_outputs_expected_frames():
         assert run_config["dataset"]["include_zerovar"] is True
 
 
+def test_run_resnet50_kfold_mean7_decoding_outputs_expected_frames():
+    transform = make_deterministic_transform(input_size=32)
+    dataset = EPGabors(
+        img_dir=IMG_DIR,
+        include_vertical=True,
+        include_single=False,
+        include_zerovar=True,
+        filter_ss=[4],
+        filter_sd=[0],
+        filter_mean=[-12, -8, -4, 0, 4, 8, 12],
+        filter_instance=[1, 2, 3, 4, 5],
+        transform=transform,
+        return_filename=True,
+        return_condition_id=True,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (
+            trial_df,
+            fold_metrics_df,
+            layer_summary_df,
+            confusion_counts_df,
+            confusion_normalized_df,
+            timing_df,
+        ) = run_resnet50_kfold_mean7_decoding(
+            dataset=dataset,
+            output_dir=tmpdir,
+            selected_layer="layer4_last",
+            decoder_name="sgd_hinge",
+            n_splits=5,
+            pretrained=False,
+            device="cpu",
+            batch_size=2,
+            num_workers=0,
+            random_state=0,
+            measure_timing=True,
+            max_iter=2000,
+        )
+
+        assert not trial_df.empty
+        assert not fold_metrics_df.empty
+        assert not layer_summary_df.empty
+        assert not confusion_counts_df.empty
+        assert not confusion_normalized_df.empty
+        assert not timing_df.empty
+        assert trial_df.columns.tolist() == MEAN7_TRIAL_COLUMNS
+        assert fold_metrics_df.columns.tolist() == MEAN7_FOLD_METRIC_COLUMNS
+        assert set(trial_df["target_mean"].unique().tolist()) == {-12, -8, -4, 0, 4, 8, 12}
+        assert set(trial_df["pred_mean"].unique().tolist()).issubset({-12, -8, -4, 0, 4, 8, 12})
+        assert confusion_counts_df.shape == (7, 8)
+        assert confusion_normalized_df.shape == (7, 8)
+        assert confusion_counts_df["target_mean"].tolist() == [-12, -8, -4, 0, 4, 8, 12]
+
+        prefix = os.path.join(tmpdir, "resnet50_layer4_last_kfold_mean7")
+        assert os.path.exists(f"{prefix}_trial_outputs.csv")
+        assert os.path.exists(f"{prefix}_fold_metrics.csv")
+        assert os.path.exists(f"{prefix}_layer_summary.csv")
+        assert os.path.exists(f"{prefix}_confusion_counts.csv")
+        assert os.path.exists(f"{prefix}_confusion_normalized.csv")
+        assert os.path.exists(f"{prefix}_dataset_summary.csv")
+        assert os.path.exists(f"{prefix}_run_config.json")
+        assert os.path.exists(f"{prefix}_timing.csv")
+
+        with open(f"{prefix}_run_config.json", "r", encoding="utf-8") as handle:
+            run_config = json.load(handle)
+        assert run_config["classification_mode"] == "mean7"
+        assert run_config["class_labels"] == [-12, -8, -4, 0, 4, 8, 12]
+
+
 def test_legacy_wrappers_and_package_imports_match():
     import epgabor_regression_pipeline
     import epgabor_v1_pipeline
@@ -332,6 +435,7 @@ def test_legacy_wrappers_and_package_imports_match():
 
     assert epgabors.EPGabors is EPGabors
     assert epgabor_v1_pipeline.run_resnet50_kfold_decoding.__module__ == "epgabors.runners"
+    assert epgabor_v1_pipeline.run_resnet50_kfold_mean7_decoding.__module__ == "epgabors.runners"
     assert epgabor_regression_pipeline.run_resnet50_kfold_regression.__module__ == "epgabors.runners"
 
 

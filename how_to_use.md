@@ -49,7 +49,7 @@ PRETRAINED_FLAG=--no-pretrained LAYER_NAME=layer4_last BATCH_SIZE=4 \
 
 ## Classification Runner
 
-This predicts the sign of mean orientation:
+By default, this predicts the sign of mean orientation:
 
 - class `0`: `mean < 0`
 - class `1`: `mean > 0`
@@ -57,6 +57,8 @@ This predicts the sign of mean orientation:
 `mean=0` images are never used for classifier training or nonzero CV metrics. When present, they are evaluated separately after each fold model and are also written to a combined prediction table.
 
 For random-weight controls, add `--no-pretrained --model-seed <seed>`. Keep `--random-state` fixed when you want runs to vary only the random backbone weights.
+
+For 7-class exact mean-orientation decoding, use `--classification-mode mean7`. In this mode, `mean=0` is an ordinary class, outputs use actual orientation labels, and confusion matrix CSVs are written.
 
 Example:
 
@@ -71,6 +73,20 @@ Example:
   --model-seed 0 \
   --include-zerovar \
   --evaluate-vertical
+```
+
+Seven-class example:
+
+```bash
+/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_v1_pipeline.py \
+  --img-dir images \
+  --output-dir results_kfold_mean7 \
+  --classification-mode mean7 \
+  --layer-name layer4_last \
+  --decoder-name sgd_hinge \
+  --n-splits 5 \
+  --device cpu \
+  --include-zerovar
 ```
 
 Main outputs:
