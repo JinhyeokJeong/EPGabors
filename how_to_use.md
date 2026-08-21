@@ -1,45 +1,62 @@
 # How To Use
 
-This repository currently provides two command-line runners:
+This repository now exposes a small `epgabors` package plus backward-compatible command-line wrappers.
 
-- `epgabor_v1_pipeline.py` for binary classification
-- `epgabor_regression_pipeline.py` for regression
+## Environment
 
-Both use the same sparse ResNet50 endpoints:
-
-- `stem`
-- `layer1_last`
-- `layer2_last`
-- `layer3_last`
-- `layer4_last`
-
-## Recommended environment
-
-Use the project conda environment if available:
+Validated local interpreter:
 
 ```bash
 /Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python
 ```
 
-If you activate that environment first, you can also just use `python`.
+Install dependencies in another environment with:
 
-## 1. Classification runner
+```bash
+python -m pip install -r requirements.txt
+```
 
-This predicts the **sign** of the mean orientation:
+## One-Command Baseline
+
+Run the first ResNet50 mean-orientation baseline:
+
+```bash
+scripts/run_resnet50_mean_orientation.sh
+```
+
+Defaults:
+
+- Python: `/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python`
+- device: `cpu`
+- layer: `all`
+- image directory: `images`
+- includes `sd=0`
+- excludes `ss=1`
+
+Override for a GPU workstation:
+
+```bash
+DEVICE=cuda LAYER_NAME=layer4_last BATCH_SIZE=64 NUM_WORKERS=8 \
+  scripts/run_resnet50_mean_orientation.sh
+```
+
+Use random ResNet50 weights for a quick no-download smoke run:
+
+```bash
+PRETRAINED_FLAG=--no-pretrained LAYER_NAME=layer4_last BATCH_SIZE=4 \
+  scripts/run_resnet50_mean_orientation.sh
+```
+
+## Classification Runner
+
+This predicts the sign of mean orientation:
 
 - class `0`: `mean < 0`
 - class `1`: `mean > 0`
 
-Default behavior:
+`mean=0` images are never used for classifier training or nonzero CV metrics. When present, they are evaluated separately after each fold model and are also written to a combined prediction table.
 
-- excludes `ss=1`
-- excludes `sd=0`
-- excludes `mean=0` from training/test folds
-- optionally evaluates `mean=0` images after training
-
-### Example
-
-Run all sparse endpoints with the default linear SVM:
+Example:
 
 ```bash
 /Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_v1_pipeline.py \
@@ -48,61 +65,28 @@ Run all sparse endpoints with the default linear SVM:
   --layer-name all \
   --decoder-name linear_svc \
   --n-splits 5 \
-  --device cpu
+  --device cpu \
+  --include-zerovar \
+  --evaluate-vertical
 ```
 
-Run one layer only:
-
-```bash
-/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_v1_pipeline.py \
-  --img-dir images \
-  --output-dir results_kfold \
-  --layer-name layer4_last \
-  --decoder-name linear_svc \
-  --n-splits 5 \
-  --device cpu
-```
-
-### Main arguments
-
-- `--layer-name`: `all`, `stem`, `layer1_last`, `layer2_last`, `layer3_last`, or `layer4_last`
-- `--decoder-name`: `linear_svc` or `sgd_hinge`
-- `--n-splits`: number of cross-validation folds (default `5`)
-- `--device`: usually `cpu`; use `cuda` if available and desired
-- `--pretrained` / `--no-pretrained`: use pretrained ResNet50 weights or not
-- `--evaluate-vertical` / `--no-evaluate-vertical`: whether `mean=0` images are scored after each fold
-- `--include-single`: include `ss=1` images
-- `--include-zerovar`: include `sd=0` images
-- `--include-vertical` / `--no-include-vertical`: manually control whether `mean=0` images are present in the dataset
-- `--dataset-means`: comma-separated means to keep, for example `--dataset-means -4,0,4`
-- `--dataset-sds`: comma-separated SD levels to keep, for example `--dataset-sds 4,8,16`
-- `--dataset-sss`: comma-separated set sizes to keep, for example `--dataset-sss 4,8,16`
-- `--dataset-instances`: comma-separated instance IDs to keep, for example `--dataset-instances 1,2,3,4,5`
-
-### Output files
-
-For `--layer-name all`, the main outputs are written to `results_kfold/` with names like:
+Main outputs:
 
 - `resnet50_all_layers_kfold_trial_outputs.csv`
 - `resnet50_all_layers_kfold_fold_metrics.csv`
 - `resnet50_all_layers_kfold_layer_summary.csv`
-- `resnet50_all_layers_kfold_vertical_boundary_outputs.csv` (if enabled)
-- `resnet50_all_layers_kfold_vertical_boundary_summary.csv` (if enabled)
+- `resnet50_all_layers_kfold_vertical_boundary_outputs.csv`
+- `resnet50_all_layers_kfold_vertical_boundary_summary.csv`
+- `resnet50_all_layers_kfold_combined_predictions.csv`
+- `resnet50_all_layers_kfold_dataset_summary.csv`
+- `resnet50_all_layers_kfold_run_config.json`
 - `resnet50_all_layers_kfold_timing.csv`
 
-## 2. Regression runner
+## Regression Runner
 
-This predicts the **raw mean orientation in degrees** using L2-regularized regression.
+This predicts raw mean orientation in degrees using Ridge regression by default.
 
-Default behavior:
-
-- includes `mean=0`
-- excludes `ss=1`
-- excludes `sd=0`
-
-### Example
-
-Run all sparse endpoints with Ridge regression:
+Example:
 
 ```bash
 /Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_regression_pipeline.py \
@@ -112,65 +96,30 @@ Run all sparse endpoints with Ridge regression:
   --regressor-name ridge \
   --n-splits 5 \
   --target-scaling none \
-  --device cpu
+  --device cpu \
+  --include-zerovar \
+  --include-vertical
 ```
 
-Run one layer only with SGD regression:
-
-```bash
-/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_regression_pipeline.py \
-  --img-dir images \
-  --output-dir results_kfold_regression \
-  --layer-name layer4_last \
-  --regressor-name sgd_squared_error \
-  --n-splits 5 \
-  --target-scaling standardize \
-  --device cpu
-```
-
-### Main arguments
-
-- `--layer-name`: `all`, `stem`, `layer1_last`, `layer2_last`, `layer3_last`, or `layer4_last`
-- `--regressor-name`: `ridge` or `sgd_squared_error`
-- `--n-splits`: number of cross-validation folds (default `5`)
-- `--target-scaling`: `none` or `standardize`
-- `--ridge-alpha`: L2 strength for Ridge (default `1.0`)
-- `--sgd-alpha`: L2 strength for SGDRegressor
-- `--device`: usually `cpu`; use `cuda` if available and desired
-- `--pretrained` / `--no-pretrained`: use pretrained ResNet50 weights or not
-- `--include-single`: include `ss=1` images
-- `--include-zerovar`: include `sd=0` images
-- `--include-vertical` / `--no-include-vertical`: include or exclude `mean=0` images (default is to include them)
-- `--dataset-means`, `--dataset-sds`, `--dataset-sss`, `--dataset-instances`: same filtering format as the classification runner
-
-### Output files
-
-For `--layer-name all`, the main outputs are written to `results_kfold_regression/` with names like:
+Main outputs:
 
 - `resnet50_all_layers_kfold_regression_trial_outputs.csv`
 - `resnet50_all_layers_kfold_regression_fold_metrics.csv`
 - `resnet50_all_layers_kfold_regression_layer_summary.csv`
+- `resnet50_all_layers_kfold_regression_dataset_summary.csv`
+- `resnet50_all_layers_kfold_regression_run_config.json`
 - `resnet50_all_layers_kfold_regression_timing.csv`
 
-## 3. Helpful utility command
+## Useful Commands
 
-To list the supported sparse endpoint names:
+List supported ResNet50 endpoints:
 
 ```bash
 /Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_v1_pipeline.py --list-layers
 ```
 
-or
+Run tests:
 
 ```bash
-/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python epgabor_regression_pipeline.py --list-layers
+/Users/jeongj/miniconda3/envs/pip-torch-bayes/bin/python -m pytest -q
 ```
-
-## 4. Practical notes
-
-- Start with `--layer-name layer4_last` if you want a quick smoke run before using `all`.
-- Keep `--batch-size` small on CPU if memory is tight.
-- Use `sgd_hinge` or `sgd_squared_error` when flattened features are too large for the default solver.
-- After a run, open the review notebooks:
-  - `kfold-results-review.ipynb` for classification
-  - `kfold-regression-results-review.ipynb` for regression

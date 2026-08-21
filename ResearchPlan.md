@@ -1,64 +1,54 @@
-# Research Plan: Sparse-Endpoint ResNet50 K-Fold Decoding
+# Research Plan: ResNet50 Mean-Orientation Readouts
 
 ## Objective
 
-Build a simple, research-oriented decoding pipeline to test whether sparse ResNet50 representations linearly encode binary mean orientation (`mean < 0` vs `mean > 0`) in the EP Gabor stimulus set.
+Revive the EP Gabor project as a small, maintainable package for testing whether deep-network layers represent orientation ensemble statistics. The first baseline uses sparse ResNet50 endpoints and asks whether mean orientation is linearly decodable.
 
-## Scope
+## Current Baseline
 
 - Model: `resnet50`
-- Endpoints:
-  - `stem`
-  - `layer1_last`
-  - `layer2_last`
-  - `layer3_last`
-  - `layer4_last`
-- Features: flatten raw endpoint activations (no extra spatial pooling)
-- Decoder:
-  - default: `LinearSVC`
-  - fallback: `SGDClassifier(loss="hinge")`
-- Evaluation:
-  - `StratifiedKFold`
-  - default `n_splits=5`
-  - stratify only on the binary class label
-- Optional boundary analysis:
-  - keep `mean=0` images out of training
-  - score them after each fold model is fit
-- Outputs:
-  - trial-level test predictions with metadata
-  - fold-level metrics
-  - layer-level aggregated summaries
-  - optional vertical-image boundary outputs
-  - timing summaries
+- Endpoints: `stem`, `layer1_last`, `layer2_last`, `layer3_last`, `layer4_last`
+- Features: flattened activations from deterministic preprocessing
+- Classification: linear binary readout of `mean < 0` vs `mean > 0`
+- Regression: L2-regularized linear regression of raw mean orientation
+- Evaluation: stratified K-fold cross-validation
 
-## Default dataset subset
+## Dataset Policy
 
-- `include_single=False` (exclude `ss=1`)
-- `include_zerovar=False` (exclude `sd=0`)
-- `mean=0` excluded from training/test folds
-- `mean=0` can still be retained in the dataset for optional boundary evaluation
+- First runnable analysis includes homogeneous orientation arrays (`sd=0`) together with heterogeneous arrays.
+- `ss=1` is excluded by default in the runner script.
+- Classification excludes `mean=0` from training and nonzero CV scoring.
+- Classification writes separate `mean=0` vertical-boundary predictions and a combined prediction table.
+- Regression includes `mean=0` by default.
 
 ## Implemented API
 
-- `get_resnet50_sparse_layer_map(pretrained=True, device="cpu")`
-- `extract_layer_features(model, layer_map, dataloader, device="cpu", feature_mode="flatten")`
-- `build_stratified_kfold_splits(labels, n_splits=5, shuffle=True, random_state=0)`
-- `fit_linear_decoder(...)`
-- `evaluate_vertical_boundary(estimator, scaler, X_vertical, metadata_vertical)`
-- `run_resnet50_kfold_decoding(...)`
+- `epgabors.data.EPGabors`
+- `epgabors.data.summarize_conditions`
+- `epgabors.data.validate_condition_grid`
+- `epgabors.models.get_resnet50_sparse_layer_map`
+- `epgabors.models.list_available_layers`
+- `epgabors.features.extract_layer_features`
+- `epgabors.readouts.fit_linear_decoder`
+- `epgabors.readouts.fit_linear_regressor`
+- `epgabors.runners.run_resnet50_kfold_decoding`
+- `epgabors.runners.run_resnet50_kfold_regression`
 
-## Validation checklist
+Legacy imports from `EPOriGabors.py`, `epgabor_v1_pipeline.py`, and `epgabor_regression_pipeline.py` are preserved.
 
-- Dataset parsing still matches the expected 14,000-image design.
+## Validation Checklist
+
+- Dataset parsing matches the expected 14,000-image design.
+- Condition summaries report balanced retained conditions.
 - Sparse endpoint mapping resolves the five expected ResNet50 modules.
-- Extracted feature matrices are 2D after flattening and have one row per image.
-- K-fold train/test indices are non-overlapping.
-- `mean=0` samples are excluded from training folds.
-- Vertical-image outputs, when enabled, remain separate from the main CV trial outputs.
-- Timing rows include feature extraction, fold decoding, layer decoding, and total runtime.
+- Feature matrices are 2D and aligned with metadata.
+- Classification folds never train or score on `mean=0`.
+- Classification combined outputs include both nonzero CV rows and vertical-boundary rows.
+- Regression folds preserve mean-orientation levels through stratification.
+- Runner scripts pass shell syntax checks.
 
-## Next likely extensions
+## Next Extensions
 
-- Add regression or multiclass readouts for mean orientation.
-- Add condition-wise summary helpers for plots by `sd` and `ss`.
-- Extend the same pipeline pattern to other network architectures once the ResNet50 baseline is stable.
+- Add condition-wise plotting notebooks for outputs by `sd`, `ss`, and `mean`.
+- Add additional model families after the ResNet50 baseline is stable.
+- Consider CORnet as a later biologically motivated model extension.

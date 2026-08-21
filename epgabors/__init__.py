@@ -1,4 +1,4 @@
-"""Backward-compatible import path for the EP Gabor dataset."""
+"""EP Gabor mean-orientation analysis package."""
 
 from epgabors.data import EPGABOR_PATTERN, EPGabors, summarize_conditions, validate_condition_grid
 
